@@ -151,6 +151,10 @@ public sealed class FezDepthProxyFollower : MonoBehaviour
 
     private void Tick(float dt, bool alignToPlatformBody = false)
     {
+        // The new motor reads real platform geometry; moving an invisible collider is obsolete.
+        if (playerRoot != null && playerRoot.TryGetComponent<PlayerController>(out var motor)
+            && motor.isActiveAndEnabled) return;
+
         if (PlayerController.IsDropThroughActiveStatic)
             return;
 

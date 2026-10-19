@@ -2,339 +2,515 @@ using System.Collections.Generic;
 using UnityEngine;
 
 /// <summary>
-/// 單向平台（One-Way）：從下方往上移動時可穿過，站在頂上時可承載。
-/// 掛在 DepthProxy（需有 <see cref="Collider"/>）上；可額外指定「平台本體」碰撞器。
-/// 預設上穿時只暫關 DepthProxy，FezPlatform 本體維持碰撞（含跳躍中）。
-/// 由 <see cref="PlayerController"/> 在 <c>CharacterController.Move</c> 前後呼叫 <see cref="BeginPlayerMove"/>／<see cref="EndPlayerMove"/>。
+/// Registered real platform geometry. The motor samples its projected top at the player's feet.
+/// Neither this component nor a proxy moves the player or toggles a scene collider.
 /// </summary>
 [RequireComponent(typeof(Collider))]
 [DisallowMultipleComponent]
 public sealed class FezOneWayPlatform : MonoBehaviour
 {
-    private static readonly List<FezOneWayPlatform> Registered = new List<FezOneWayPlatform>(32);
-    private static readonly List<FezOneWayPlatform> DisabledThisMove = new List<FezOneWayPlatform>(8);
-
-    [Header("碰撞器")]
-    [Tooltip("勾選且下方陣列為空時，自動把「父物件」上的 Collider 當平台本體（子物件掛 DepthProxy 時常用）。")]
+    private static readonly List<FezOneWayPlatform> Registered = new List<FezOneWayPlatform>(64);
+    internal static IReadOnlyList<FezOneWayPlatform> ActivePlatforms => Registered;
+    private static readonly Dictionary<Collider, List<FezOneWayPlatform>> BodyOwners =
+        new Dictionary<Collider, List<FezOneWayPlatform>>();
+    private static readonly Dictionary<Collider, List<FezOneWayPlatform>> AllColliderOwners =
+        new Dictionary<Collider, List<FezOneWayPlatform>>();
+    private static readonly HashSet<FezOneWayPlatform> CandidateSet = new HashSet<FezOneWayPlatform>();
+    private static readonly List<FezOneWayPlatform> CandidatePlatforms = new List<FezOneWayPlatform>(64);
+    private static Collider[] CandidateColliders = new Collider[128];
+    private const float CandidateHalfWidth = 0.025f;
+    private const float CandidateDepthReach = 10000f;
+    private static float MaxWorldTopOffset;
+    private static int _nextRegistrationOrder;
+    private static readonly Dictionary<CharacterController, HashSet<Collider>> Ignored =
+        new Dictionary<CharacterController, HashSet<Collider>>();
+    private static readonly HashSet<FezOneWayPlatform> DirtyPlatforms = new HashSet<FezOneWayPlatform>();
+    private static readonly HashSet<CharacterController> PreparedPlayers = new HashSet<CharacterController>();
     [SerializeField] private bool autoIncludeParentCollider = true;
-
-    [Tooltip("平台本體的碰撞器（例如父物件的 BoxCollider）；可放多個。")]
     [SerializeField] private Collider[] platformBodyColliders;
-
-    [Tooltip("開啟：上穿時本體也暫關（舊行為）。關閉（預設）：只暫關 DepthProxy，本體跳躍時仍碰撞。")]
-    [SerializeField] private bool disableBodyCollidersWhenPassing = false;
-
-    [Tooltip("用哪個 Collider 的 bounds.max.y 當「頂面」高度；不填則優先使用「平台本體」第一個，否則用本物件 DepthProxy。")]
     [SerializeField] private Collider topSurfaceReference;
-
-    [Header("頂面（世界 Y）")]
-    [Tooltip("在頂面參考 Collider 的 bounds.max.y 上再加減的偏移；正數＝頂面視為更高。")]
     [SerializeField] private float worldTopYOffset;
+    private Collider _proxy;
+    private Collider[] _bodies, _all;
+    private int _registrationOrder;
 
-    [Tooltip("腳底須比「頂面」低至少這麼多，才視為在平台下方（可向上穿過）。")]
-    [SerializeField] private float feetBelowTopMin = 0.08f;
-
-    [Tooltip("垂直速度大於此值才視為「正在上升」，避免水平蹭到側邊時誤判。")]
-    [SerializeField] private float riseSpeedThreshold = 0.05f;
-
-    private enum OneWayGateMode
+    public struct SupportHit
     {
-        /// <summary>用腳底與平台頂面的相對位置判定（原本的 belowDeck）。</summary>
-        FeetBelowTop = 0,
-        /// <summary>用玩家座標（中心點）與平台頂面的相對位置判定：平台頂面高於玩家時才可穿透。</summary>
-        PlatformAbovePlayer = 1
+        public FezOneWayPlatform platform;
+        public Collider collider;
+        public Vector3 point;
     }
-
-    [Header("切換策略")]
-    [Tooltip("關閉時：只要角色腳底在頂面下方，就暫時禁用碰撞（不侷限跳躍上升）。\n開啟時：保留舊行為，需要正在上升才禁用。")]
-    [SerializeField] private bool gateByVerticalVelocity = false;
-
-    [Header("判定模式")]
-    [SerializeField] private OneWayGateMode gateMode = OneWayGateMode.FeetBelowTop;
-    [Tooltip("PlatformAbovePlayer 模式用：平台頂面至少要高於玩家中心點這麼多才會可穿透。")]
-    [SerializeField] private float platformAbovePlayerMin = 0.05f;
-    [Tooltip("防止站在平台上抽搐：當玩家已 grounded 且腳底接近頂面時，強制本幀維持碰撞（不穿透）。")]
-    [SerializeField] private bool keepSolidWhenGroundedOnTop = true;
-
-    private Collider _proxyCollider;
-    private Collider[] _passThroughColliders;
-    private Collider[] _allPlatformColliders;
 
     private void Awake()
     {
-        _proxyCollider = GetComponent<Collider>();
-        BuildToggleSet();
-    }
-
-    private void OnValidate()
-    {
-        if (Application.isPlaying)
-            return;
-        _proxyCollider = GetComponent<Collider>();
-        BuildToggleSet();
-    }
-
-    private void BuildToggleSet()
-    {
-        var proxy = _proxyCollider != null ? _proxyCollider : GetComponent<Collider>();
-        var bodies = CollectBodyColliders();
-
-        var pass = new List<Collider>(1 + bodies.Count);
-        if (proxy != null)
-            pass.Add(proxy);
-
-        if (disableBodyCollidersWhenPassing)
-        {
-            for (var i = 0; i < bodies.Count; i++)
-            {
-                var c = bodies[i];
-                if (c != null && !pass.Contains(c))
-                    pass.Add(c);
-            }
-        }
-
-        var all = new List<Collider>(pass.Count + bodies.Count);
-        for (var i = 0; i < pass.Count; i++)
-        {
-            var c = pass[i];
-            if (c != null && !all.Contains(c))
-                all.Add(c);
-        }
-
-        for (var i = 0; i < bodies.Count; i++)
-        {
-            var c = bodies[i];
-            if (c != null && !all.Contains(c))
-                all.Add(c);
-        }
-
-        _passThroughColliders = pass.ToArray();
-        _allPlatformColliders = all.ToArray();
-    }
-
-    private List<Collider> CollectBodyColliders()
-    {
-        var bodies = new List<Collider>(2);
-        var extras = platformBodyColliders;
-        if (extras != null)
-        {
-            for (var i = 0; i < extras.Length; i++)
-            {
-                var c = extras[i];
-                if (IsUsableBodyCollider(c) && !bodies.Contains(c))
-                    bodies.Add(c);
-            }
-        }
-
-        if (autoIncludeParentCollider && transform.parent != null &&
-            (extras == null || extras.Length == 0))
-        {
-            var root = transform.parent;
-            var cols = root.GetComponentsInChildren<Collider>(includeInactive: false);
-            for (var i = 0; i < cols.Length; i++)
-            {
-                var c = cols[i];
-                if (!IsUsableBodyCollider(c) || c == _proxyCollider || bodies.Contains(c))
-                    continue;
-                if (c.GetComponent<FezOneWayPlatform>() != null)
-                    continue;
-                bodies.Add(c);
-            }
-        }
-
-        return bodies;
-    }
-
-    private static bool IsUsableBodyCollider(Collider c)
-    {
-        return c != null && c.enabled && c.gameObject.activeInHierarchy && !c.isTrigger;
-    }
-
-    private Collider GetTopReference()
-    {
-        if (topSurfaceReference != null)
-            return topSurfaceReference;
-
-        // 頂面以「可走平台」為準：優先本體（通常比透明箱貼地）
+        _proxy = GetComponent<Collider>();
+        var bodies = new List<Collider>();
         if (platformBodyColliders != null)
-        {
-            for (var i = 0; i < platformBodyColliders.Length; i++)
-            {
-                var c = platformBodyColliders[i];
-                if (c != null)
-                    return c;
-            }
-        }
-
+            foreach (var col in platformBodyColliders)
+                if (col != null && col != _proxy && !bodies.Contains(col)) bodies.Add(col);
+        if (bodies.Count == 0 && autoIncludeParentCollider && transform.parent != null)
+            foreach (var col in transform.parent.GetComponentsInChildren<Collider>(true))
+                if (col != _proxy && !col.isTrigger &&
+                    col.GetComponentInParent<FezDepthProxyFollower>() == null &&
+                    !bodies.Contains(col)) bodies.Add(col);
+        if (topSurfaceReference != null && !bodies.Contains(topSurfaceReference))
+            bodies.Add(topSurfaceReference);
+        // Standalone authored one-way colliders remain usable too.
+        if (bodies.Count == 0 && _proxy != null) bodies.Add(_proxy);
+        _bodies = bodies.ToArray();
+        if (_proxy != null && !bodies.Contains(_proxy)) bodies.Add(_proxy);
+        // Explicit top references need not enumerate every duplicate body collider (e.g. ProBuilder).
         if (autoIncludeParentCollider && transform.parent != null)
+            foreach (var col in transform.parent.GetComponentsInChildren<Collider>(true))
+                if (!col.isTrigger && !bodies.Contains(col)) bodies.Add(col);
+        _all = bodies.ToArray();
+        MaxWorldTopOffset = Mathf.Max(MaxWorldTopOffset, Mathf.Abs(worldTopYOffset));
+        for (int i = 0; i < _all.Length; i++)
         {
-            var cols = transform.parent.GetComponentsInChildren<Collider>(includeInactive: false);
-            for (var i = 0; i < cols.Length; i++)
+            var col = _all[i];
+            if (col == null) continue;
+            if (!AllColliderOwners.TryGetValue(col, out var owners))
             {
-                var c = cols[i];
-                if (IsUsableBodyCollider(c) && c.GetComponent<FezOneWayPlatform>() == null)
-                    return c;
+                owners = new List<FezOneWayPlatform>(1);
+                AllColliderOwners.Add(col, owners);
             }
+            if (!owners.Contains(this)) owners.Add(this);
         }
-
-        if (_proxyCollider != null)
-            return _proxyCollider;
-        return GetComponent<Collider>();
+        for (int i = 0; i < _bodies.Length; i++)
+        {
+            var body = _bodies[i];
+            if (body == null) continue;
+            if (!BodyOwners.TryGetValue(body, out var owners))
+            {
+                owners = new List<FezOneWayPlatform>(1);
+                BodyOwners.Add(body, owners);
+            }
+            if (!owners.Contains(this)) owners.Add(this);
+        }
+        foreach (var col in _all)
+        {
+            if (col == null) continue;
+            var relay = col.GetComponent<FezPlatformCollisionLifecycle>();
+            if (relay == null) relay = col.gameObject.AddComponent<FezPlatformCollisionLifecycle>();
+            relay.Register(this);
+        }
     }
 
     private void OnEnable()
     {
-        if (!Registered.Contains(this))
-            Registered.Add(this);
+        if (!Registered.Contains(this)) Registered.Add(this);
+        _registrationOrder = _nextRegistrationOrder++;
+        NotifyCollisionStateChanged();
     }
 
     private void OnDisable()
     {
         Registered.Remove(this);
-        EnablePassThroughColliders();
+        DirtyPlatforms.Remove(this);
     }
 
-    private void EnablePassThroughColliders()
+    private void OnDestroy()
     {
-        if (_passThroughColliders == null)
-            return;
-        for (var i = 0; i < _passThroughColliders.Length; i++)
+        if (_bodies != null)
+        foreach (var body in _bodies)
         {
-            var c = _passThroughColliders[i];
-            if (c != null)
-                c.enabled = true;
+            if (body == null || !BodyOwners.TryGetValue(body, out var owners)) continue;
+            owners.Remove(this);
+            if (owners.Count == 0) BodyOwners.Remove(body);
+        }
+        if (_all != null)
+        foreach (var col in _all)
+        {
+            if (col == null || !AllColliderOwners.TryGetValue(col, out var owners)) continue;
+            owners.Remove(this);
+            if (owners.Count == 0) AllColliderOwners.Remove(col);
+        }
+        if (_all == null) return;
+        foreach (var col in _all)
+        {
+            if (col == null) continue;
+            var relay = col.GetComponent<FezPlatformCollisionLifecycle>();
+            if (relay != null) relay.Unregister(this);
         }
     }
 
-    private void EnsurePassThroughCollidersEnabledIfNeeded()
+    // Call after changing Collider.enabled or Rigidbody collision participation directly.
+    // GameObject activation is reported automatically by the lifecycle relay.
+    public void NotifyCollisionStateChanged()
     {
-        if (_passThroughColliders == null)
-            return;
-        for (var i = 0; i < _passThroughColliders.Length; i++)
-        {
-            var c = _passThroughColliders[i];
-            if (c != null && !c.enabled)
-                c.enabled = true;
-        }
+        if (isActiveAndEnabled) DirtyPlatforms.Add(this);
     }
 
-    /// <summary>在 <c>Move</c> 之前呼叫：符合條件的平台會暫時關閉相關 Collider。</summary>
-    public static void BeginPlayerMove(CharacterController cc, float worldVelocityY)
+    // A disabled/recreated CharacterController can lose its native ignore-pair state.
+    public static void InvalidatePlayerCollisionState(CharacterController player)
     {
-        DisabledThisMove.Clear();
-        if (cc == null)
-            return;
+        if (player != null) PreparedPlayers.Remove(player);
+    }
 
-        var feetY = cc.bounds.min.y;
-        var playerY = cc.bounds.center.y;
-
-        for (var i = 0; i < Registered.Count; i++)
+    public static void PreparePlayer(CharacterController player)
+    {
+        if (player == null) return;
+        if (!player.enabled || !player.gameObject.activeInHierarchy)
         {
-            var p = Registered[i];
-            if (p == null || !p.isActiveAndEnabled)
+            PreparedPlayers.Remove(player);
+            return;
+        }
+        if (!Ignored.TryGetValue(player, out var set))
+        {
+            set = new HashSet<Collider>();
+            Ignored.Add(player, set);
+        }
+        bool initializedNow = PreparedPlayers.Add(player);
+        if (initializedNow)
+        {
+            foreach (var platform in Registered) PreparePlatform(player, set, platform);
+        }
+        // Steady state: no iteration over platforms or collider pairs.
+        if (DirtyPlatforms.Count == 0) return;
+        foreach (var entry in Ignored)
+        {
+            var otherPlayer = entry.Key;
+            if (initializedNow && otherPlayer == player) continue;
+            if (otherPlayer == null || !otherPlayer.enabled || !otherPlayer.gameObject.activeInHierarchy)
+            {
+                PreparedPlayers.Remove(otherPlayer);
                 continue;
-
-            var topRef = p.GetTopReference();
-            if (topRef == null)
-                continue;
-
-            var topY = topRef.bounds.max.y + p.worldTopYOffset;
-            bool allowPass;
-            switch (p.gateMode)
-            {
-                case OneWayGateMode.PlatformAbovePlayer:
-                    allowPass = topY > playerY + p.platformAbovePlayerMin;
-                    if (p.keepSolidWhenGroundedOnTop && cc.isGrounded)
-                    {
-                        // 站在頂面附近時，避免平台被關閉導致「掉下去又被抓回來」的上下抽搐。
-                        var standingOnTop = feetY >= topY - p.feetBelowTopMin;
-                        if (standingOnTop)
-                            allowPass = false;
-                    }
-                    break;
-                default:
-                    allowPass = feetY < topY - p.feetBelowTopMin;
-                    if (p.keepSolidWhenGroundedOnTop && cc.isGrounded)
-                    {
-                        var standingOnTop = feetY >= topY - p.feetBelowTopMin;
-                        if (standingOnTop)
-                            allowPass = false;
-                    }
-                    break;
             }
-            var rising = worldVelocityY > p.riseSpeedThreshold;
-            var shouldDisable = allowPass && (!p.gateByVerticalVelocity || rising);
-            // 從上方落下時不可關閉承載碰撞（薄片頂面 + 腳底微穿入時，否則會整幀像穿透）
-            if (worldVelocityY < -p.riseSpeedThreshold)
-                shouldDisable = false;
-
-            if (shouldDisable)
-            {
-                p.SetPassThroughCollidersEnabled(false);
-                DisabledThisMove.Add(p);
-            }
-            else
-            {
-                p.EnsurePassThroughCollidersEnabledIfNeeded();
-            }
+            foreach (var platform in DirtyPlatforms) PreparePlatform(otherPlayer, entry.Value, platform);
         }
+        DirtyPlatforms.Clear();
     }
 
-    /// <summary>在 <c>Move</c> 之後呼叫：還原本幀關閉的 Collider。</summary>
-    public static void EndPlayerMove()
+    private static void PreparePlatform(CharacterController player, HashSet<Collider> set,
+        FezOneWayPlatform platform)
     {
-        for (var i = 0; i < DisabledThisMove.Count; i++)
+        if (platform == null || !platform.isActiveAndEnabled || platform._all == null) return;
+        foreach (var col in platform._all)
         {
-            var p = DisabledThisMove[i];
-            if (p != null)
-                p.EnablePassThroughColliders();
+            if (col == null || col == player || !col.enabled || !col.gameObject.activeInHierarchy) continue;
+            // A shared authoring parent must never turn a solid routing wall into a one-way body.
+            if (col.GetComponentInParent<FezBackgroundWall>() != null) continue;
+            // Only the moving depth proxy is query geometry. The authored block remains solid.
+            if (col.GetComponentInParent<FezDepthProxyFollower>() == null ||
+                System.Array.IndexOf(platform._bodies, col) >= 0)
+            {
+                if (set.Remove(col)) Physics.IgnoreCollision(player, col, false);
+                continue;
+            }
+            // Query only on registration/invalidation. Preserve ignores owned by other systems.
+            if (Physics.GetIgnoreCollision(player, col)) continue;
+            Physics.IgnoreCollision(player, col, true);
+            set.Add(col);
         }
-
-        DisabledThisMove.Clear();
     }
 
-    /// <summary>由任一 collider 反查所屬的 one-way 平台（包含本體、proxy、自動父層）。</summary>
+    public static void ReleasePlayer(CharacterController player)
+    {
+        PreparedPlayers.Remove(player);
+        if (player == null || !Ignored.TryGetValue(player, out var set)) return;
+        foreach (var col in set)
+            if (col != null) Physics.IgnoreCollision(player, col, false);
+        Ignored.Remove(player);
+    }
+
+    public static bool FindFloor(CharacterController player, Vector3 startFeet, Vector3 endFeet,
+        Vector3 depthAxis, float tolerance, out SupportHit best, float ignoredTop = float.PositiveInfinity,
+        bool characterMostlyVisible = true, float lateralMargin = 0f, bool preserveDepth = false)
+    {
+        best = default;
+        float top = float.NegativeInfinity;
+        if (FindProjectedCandidates(endFeet, depthAxis, endFeet.y - tolerance,
+                startFeet.y + tolerance, lateralMargin))
+        {
+            for (int i = 0; i < CandidatePlatforms.Count; i++)
+                ConsiderProjectedFloor(player, CandidatePlatforms[i], startFeet, endFeet,
+                    depthAxis, tolerance, ignoredTop, characterMostlyVisible, lateralMargin, preserveDepth,
+                    ref top, ref best);
+        }
+        else
+        {
+            // A saturated or empty broad-phase result is not trusted; retain the original
+            // complete search as a correctness fallback for unusual geometry/world scales.
+            foreach (var platform in Registered)
+                ConsiderProjectedFloor(player, platform, startFeet, endFeet, depthAxis,
+                    tolerance, ignoredTop, characterMostlyVisible, lateralMargin, preserveDepth,
+                    ref top, ref best);
+        }
+        return best.platform != null;
+    }
+
+    private static void ConsiderProjectedFloor(CharacterController player, FezOneWayPlatform platform,
+        Vector3 startFeet, Vector3 endFeet, Vector3 depthAxis, float tolerance, float ignoredTop,
+        bool characterMostlyVisible, float lateralMargin, bool preserveDepth, ref float top, ref SupportHit best)
+    {
+        if (platform == null || !platform.isActiveAndEnabled ||
+            !platform.TrySample(endFeet, depthAxis, out var hit,
+                endFeet.y - tolerance, startFeet.y + tolerance, lateralMargin, preserveDepth)) return;
+        if (hit.point.y > startFeet.y + tolerance || hit.point.y < endFeet.y - tolerance) return;
+        if (hit.point.y >= ignoredTop - tolerance || hit.point.y < top) return;
+        float requiredDepthShift = Vector3.Dot(hit.point - endFeet, depthAxis);
+        if (!characterMostlyVisible && Mathf.Abs(requiredDepthShift) > tolerance) return;
+        if (!FezPlatformViewOcclusion.IsFootVisible(player.transform, hit.point,
+                depthAxis, platform._all)) return;
+        if (Mathf.Abs(hit.point.y - top) < 0.0001f && best.platform != null)
+        {
+            float candidateDepth = preserveDepth ? Mathf.Abs(requiredDepthShift) : Vector3.Dot(hit.point, depthAxis);
+            float previousDepth = preserveDepth
+                ? Mathf.Abs(Vector3.Dot(best.point - endFeet, depthAxis)) : Vector3.Dot(best.point, depthAxis);
+            if (candidateDepth >= previousDepth) return;
+        }
+        top = hit.point.y;
+        best = hit;
+    }
+
+    /// <summary>
+    /// Finds real platform geometry directly below the player's current world-space foot point.
+    /// This is the hidden-world support path: it does not require camera visibility and never
+    /// projects the player along the depth axis onto a different plane.
+    /// </summary>
+    public static bool FindFloorAtCurrentDepth(Vector3 startFeet, Vector3 endFeet,
+        float tolerance, out SupportHit best, float ignoredTop = float.PositiveInfinity)
+    {
+        return FindFloorAtCurrentDepth(startFeet, endFeet, tolerance, out best,
+            Vector3.forward, 0f, ignoredTop);
+    }
+
+    public static bool FindFloorAtCurrentDepth(Vector3 startFeet, Vector3 endFeet,
+        float tolerance, out SupportHit best, Vector3 depthAxis, float lateralMargin = 0f,
+        float ignoredTop = float.PositiveInfinity)
+    {
+        best = default;
+        float top = float.NegativeInfinity;
+        if (FindAnchoredCandidates(startFeet, endFeet, tolerance, depthAxis, lateralMargin))
+        {
+            for (int i = 0; i < CandidatePlatforms.Count; i++)
+                ConsiderAnchoredFloor(CandidatePlatforms[i], startFeet, endFeet,
+                    tolerance, depthAxis, lateralMargin, ignoredTop, ref top, ref best);
+        }
+        else
+        {
+            foreach (var platform in Registered)
+                ConsiderAnchoredFloor(platform, startFeet, endFeet, tolerance,
+                    depthAxis, lateralMargin, ignoredTop, ref top, ref best);
+        }
+        return best.platform != null;
+    }
+
+    private static void ConsiderAnchoredFloor(FezOneWayPlatform platform, Vector3 startFeet,
+        Vector3 endFeet, float tolerance, Vector3 depthAxis, float lateralMargin,
+        float ignoredTop, ref float top, ref SupportHit best)
+    {
+        if (platform == null || !platform.isActiveAndEnabled ||
+            !platform.TryGetAnchoredFloor(startFeet, endFeet, tolerance, out var hit,
+                depthAxis, lateralMargin)) return;
+        if (hit.point.y >= ignoredTop - tolerance || hit.point.y < top) return;
+        top = hit.point.y;
+        best = hit;
+    }
+
+    private static bool FindProjectedCandidates(Vector3 foot, Vector3 axis, float minY, float maxY,
+        float lateralMargin)
+    {
+        axis = axis.sqrMagnitude > 0.0001f ? axis.normalized : Vector3.forward;
+        return QueryCandidates(foot, axis, minY - MaxWorldTopOffset,
+            maxY + MaxWorldTopOffset, CandidateHalfWidth + lateralMargin, CandidateDepthReach);
+    }
+
+    private static bool FindAnchoredCandidates(Vector3 startFeet, Vector3 endFeet,
+        float tolerance, Vector3 depthAxis, float lateralMargin)
+    {
+        float minY = endFeet.y - tolerance - MaxWorldTopOffset;
+        float maxY = startFeet.y + tolerance + MaxWorldTopOffset;
+        Vector3 center = new Vector3(endFeet.x, (minY + maxY) * 0.5f, endFeet.z);
+        float halfHeight = Mathf.Max(CandidateHalfWidth, (maxY - minY) * 0.5f + CandidateHalfWidth);
+        return QueryCandidates(center, depthAxis, center.y - halfHeight,
+            center.y + halfHeight, CandidateHalfWidth + lateralMargin, CandidateHalfWidth);
+    }
+
+    private static bool QueryCandidates(Vector3 center, Vector3 depthAxis,
+        float minY, float maxY, float halfWidth, float halfDepth)
+    {
+        CandidateSet.Clear();
+        CandidatePlatforms.Clear();
+        depthAxis.y = 0f;
+        depthAxis = depthAxis.sqrMagnitude > 0.0001f ? depthAxis.normalized : Vector3.forward;
+        Vector3 right = Vector3.Cross(Vector3.up, depthAxis).normalized;
+        float halfHeight = Mathf.Max(CandidateHalfWidth, (maxY - minY) * 0.5f + CandidateHalfWidth);
+        center.y = (minY + maxY) * 0.5f;
+        Quaternion orientation = Quaternion.LookRotation(depthAxis, Vector3.up);
+        int count;
+        while (true)
+        {
+            count = Physics.OverlapBoxNonAlloc(center, new Vector3(halfWidth,
+                    halfHeight, halfDepth), CandidateColliders, orientation,
+                Physics.AllLayers, QueryTriggerInteraction.Collide);
+            if (count < CandidateColliders.Length) break;
+            if (CandidateColliders.Length >= 16384) return false;
+            System.Array.Resize(ref CandidateColliders, CandidateColliders.Length * 2);
+        }
+        for (int i = 0; i < count; i++)
+        {
+            var collider = CandidateColliders[i];
+            if (collider == null || !BodyOwners.TryGetValue(collider, out var owners)) continue;
+            for (int j = 0; j < owners.Count; j++)
+            {
+                var owner = owners[j];
+                if (owner != null && owner.isActiveAndEnabled && CandidateSet.Add(owner))
+                    CandidatePlatforms.Add(owner);
+            }
+        }
+        CandidatePlatforms.Sort(CompareRegistrationOrder);
+        return CandidatePlatforms.Count > 0;
+    }
+
+    private static int CompareRegistrationOrder(FezOneWayPlatform left, FezOneWayPlatform right)
+    {
+        return left._registrationOrder.CompareTo(right._registrationOrder);
+    }
+
+    /// <summary>
+    /// Finds the highest visible platform below the player's projected foot point that lies
+    /// toward the view foreground. Used to choose one stable depth target during an unlocked jump.
+    /// </summary>
+    public static bool FindVisibleForegroundFloorBelow(CharacterController player, Vector3 feet,
+        Vector3 depthAxis, float tolerance, out SupportHit best, float lateralMargin = 0f)
+    {
+        best = default;
+        if (player == null) return false;
+        depthAxis = depthAxis.sqrMagnitude > 0.0001f ? depthAxis.normalized : Vector3.forward;
+        float bestTop = float.NegativeInfinity;
+        float currentDepth = Vector3.Dot(feet, depthAxis);
+        float bestDepth = float.PositiveInfinity;
+        foreach (var platform in Registered)
+        {
+            if (platform == null || !platform.isActiveAndEnabled ||
+                !platform.TrySample(feet, depthAxis, out var hit,
+                    float.NegativeInfinity, feet.y + tolerance, lateralMargin)) continue;
+            if (hit.point.y > feet.y + tolerance ||
+                Vector3.Dot(hit.point, depthAxis) >= currentDepth - tolerance) continue;
+            if (!FezPlatformViewOcclusion.IsFootVisible(player.transform, hit.point,
+                    depthAxis, platform._all)) continue;
+
+            float hitDepth = Vector3.Dot(hit.point, depthAxis);
+            if (hit.point.y < bestTop - tolerance) continue;
+            if (Mathf.Abs(hit.point.y - bestTop) <= tolerance && hitDepth >= bestDepth) continue;
+            bestTop = hit.point.y;
+            bestDepth = hitDepth;
+            best = hit;
+        }
+        return best.platform != null;
+    }
+
+    public bool ContainsFoot(Vector3 foot, Vector3 depthAxis) => TrySample(foot, depthAxis, out _);
+
+    public bool TryGetCenteredLanding(Vector3 startFeet, Vector3 endFeet, float tolerance,
+        out SupportHit result, Vector3 depthAxis, float lateralMargin = 0f)
+    {
+        result = default;
+        return isActiveAndEnabled && TrySample(endFeet, depthAxis, out result,
+                endFeet.y - tolerance, startFeet.y + tolerance, lateralMargin, preserveDepth: false) &&
+            result.point.y <= startFeet.y + tolerance && result.point.y >= endFeet.y - tolerance;
+    }
+
+    // Retain an already acquired 2D foothold after a wall route. This samples real geometry
+    // for height and moving-platform anchoring without moving the character back in depth.
+    public bool TryGetProjectedSupport(Vector3 startFeet, Vector3 endFeet, float tolerance,
+        out SupportHit result, Vector3 depthAxis, float lateralMargin = 0f)
+    {
+        result = default;
+        return isActiveAndEnabled && TrySample(endFeet, depthAxis, out result,
+                endFeet.y - tolerance, startFeet.y + tolerance, lateralMargin, preserveDepth: true) &&
+            result.point.y <= startFeet.y + tolerance && result.point.y >= endFeet.y - tolerance;
+    }
+
+    /// <summary>Keep an acquired foothold even if the new view hides it. No projected reacquisition.</summary>
+    public bool TryGetAnchoredFloor(Vector3 startFeet, Vector3 endFeet, float tolerance,
+        out SupportHit result)
+    {
+        return TryGetAnchoredFloor(startFeet, endFeet, tolerance, out result,
+            Vector3.forward, 0f);
+    }
+
+    public bool TryGetAnchoredFloor(Vector3 startFeet, Vector3 endFeet, float tolerance,
+        out SupportHit result, Vector3 depthAxis, float lateralMargin = 0f)
+    {
+        result = default;
+        if (!isActiveAndEnabled || _bodies == null) return false;
+        depthAxis = depthAxis.sqrMagnitude > 0.0001f ? depthAxis.normalized : Vector3.forward;
+        Vector3 right = Vector3.Cross(Vector3.up, depthAxis).normalized;
+        float top = float.NegativeInfinity;
+        foreach (var body in _bodies)
+        {
+            if (body == null || !body.enabled || !body.gameObject.activeInHierarchy || body.isTrigger) continue;
+            Bounds b = body.bounds;
+            float side = Vector3.Dot(endFeet - b.center, right);
+            float half = Mathf.Abs(right.x) * b.extents.x + Mathf.Abs(right.z) * b.extents.z;
+            if (Mathf.Abs(side) > half + lateralMargin) continue;
+            float clampedSide = Mathf.Clamp(side, -half, half);
+            Vector3 samplePoint = endFeet + right * (clampedSide - side);
+            Vector3 origin = new Vector3(samplePoint.x, b.max.y + 0.1f, samplePoint.z);
+            if (!body.Raycast(new Ray(origin, Vector3.down), out var hit, b.size.y + 0.2f)) continue;
+            float y = hit.point.y + worldTopYOffset;
+            if (hit.normal.y < 0.7f || y > startFeet.y + tolerance || y < endFeet.y - tolerance || y < top) continue;
+            top = y;
+            result = new SupportHit { platform = this, collider = body, point = hit.point + Vector3.up * worldTopYOffset };
+        }
+        return result.collider != null;
+    }
+
+    private bool TrySample(Vector3 foot, Vector3 axis, out SupportHit result,
+        float minY = float.NegativeInfinity, float maxY = float.PositiveInfinity,
+        float lateralMargin = 0f, bool preserveDepth = false)
+    {
+        result = default;
+        if (_bodies == null) return false;
+        float top = float.NegativeInfinity;
+        Vector3 right = Vector3.Cross(Vector3.up, axis);
+        foreach (var body in _bodies)
+        {
+            if (body == null || !body.enabled || !body.gameObject.activeInHierarchy || body.isTrigger) continue;
+            Bounds bounds = body.bounds;
+            if (bounds.max.y + worldTopYOffset < minY || bounds.min.y + worldTopYOffset > maxY) continue;
+            float side = Vector3.Dot(foot - bounds.center, right);
+            float half = Mathf.Abs(right.x) * bounds.extents.x + Mathf.Abs(right.z) * bounds.extents.z;
+            if (Mathf.Abs(side) > half + lateralMargin + 0.0001f) continue;
+            float clampedSide = Mathf.Clamp(side, -half, half);
+            Vector3 samplePoint = foot + right * (clampedSide - side);
+            float halfDepth = Mathf.Abs(axis.x) * bounds.extents.x + Mathf.Abs(axis.z) * bounds.extents.z;
+            float depth = Vector3.Dot(samplePoint - bounds.center, axis);
+            float sampleDepth = preserveDepth
+                ? Mathf.Clamp(depth, -Mathf.Max(0f, halfDepth - 0.005f), Mathf.Max(0f, halfDepth - 0.005f))
+                : 0f;
+            Vector3 origin = samplePoint + axis * (sampleDepth - depth);
+            origin.y = bounds.max.y + 0.1f;
+            if (!body.Raycast(new Ray(origin, Vector3.down), out var hit, bounds.size.y + 0.2f)) continue;
+            if (hit.normal.y < 0.7f || hit.point.y + worldTopYOffset < top) continue;
+            top = hit.point.y + worldTopYOffset;
+            result = new SupportHit { platform = this, collider = body,
+                point = hit.point + Vector3.up * worldTopYOffset };
+        }
+        return result.collider != null;
+    }
+
     public static bool TryResolveByCollider(Collider col, out FezOneWayPlatform platform)
     {
+        if (col != null && AllColliderOwners.TryGetValue(col, out var owners))
+            for (int i = 0; i < owners.Count; i++)
+                if (owners[i] != null && owners[i].isActiveAndEnabled)
+                { platform = owners[i]; return true; }
         platform = null;
-        if (col == null)
-            return false;
-
-        for (var i = 0; i < Registered.Count; i++)
-        {
-            var p = Registered[i];
-            if (p == null || !p.isActiveAndEnabled || p._allPlatformColliders == null)
-                continue;
-
-            var all = p._allPlatformColliders;
-            for (var j = 0; j < all.Length; j++)
-            {
-                if (all[j] == col)
-                {
-                    platform = p;
-                    return true;
-                }
-            }
-        }
-
         return false;
     }
-
-    /// <summary>回傳這個平台目前會一起切換/忽略的碰撞器集合。</summary>
-    public Collider[] GetAllPlatformColliders()
+    public Collider[] GetAllPlatformColliders() => _all;
+    public IEnumerable<Collider> GetSolidBodyColliders()
     {
-        return _allPlatformColliders;
+        if (_all == null) yield break;
+        foreach (var body in _all)
+            if (body != null && !body.isTrigger &&
+                body.GetComponentInParent<FezDepthProxyFollower>() == null &&
+                body.GetComponentInParent<FezBackgroundWall>() == null) yield return body;
     }
-
-    private void SetPassThroughCollidersEnabled(bool enabled)
-    {
-        if (_passThroughColliders == null)
-            return;
-        for (var i = 0; i < _passThroughColliders.Length; i++)
-        {
-            var c = _passThroughColliders[i];
-            if (c != null)
-                c.enabled = enabled;
-        }
-    }
+    // Compatibility for older callers: no global enable/disable cycle.
+    public static void BeginPlayerMove(CharacterController player, float velocityY) => PreparePlayer(player);
+    public static void EndPlayerMove() { }
 }

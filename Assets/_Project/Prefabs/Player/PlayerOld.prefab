@@ -1261,75 +1261,6 @@ Rigidbody:
   m_Interpolate: 0
   m_Constraints: 0
   m_CollisionDetection: 0
---- !u!1 &6726332823905808870
-GameObject:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  serializedVersion: 6
-  m_Component:
-  - component: {fileID: 2446329824527622155}
-  - component: {fileID: 4235970159812468052}
-  - component: {fileID: 8605485584517581973}
-  m_Layer: 0
-  m_Name: WallRouteProbe
-  m_TagString: Untagged
-  m_Icon: {fileID: 0}
-  m_NavMeshLayer: 0
-  m_StaticEditorFlags: 0
-  m_IsActive: 0
---- !u!4 &2446329824527622155
-Transform:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 6726332823905808870}
-  serializedVersion: 2
-  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0, y: 0, z: 0}
-  m_LocalScale: {x: 1, y: 1, z: 1}
-  m_ConstrainProportionsScale: 0
-  m_Children: []
-  m_Father: {fileID: 545414944623636823}
-  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
---- !u!65 &4235970159812468052
-BoxCollider:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 6726332823905808870}
-  m_Material: {fileID: 0}
-  m_IncludeLayers:
-    serializedVersion: 2
-    m_Bits: 0
-  m_ExcludeLayers:
-    serializedVersion: 2
-    m_Bits: 0
-  m_LayerOverridePriority: 0
-  m_IsTrigger: 0
-  m_ProvidesContacts: 0
-  m_Enabled: 1
-  serializedVersion: 3
-  m_Size: {x: 1.75, y: 2.86, z: 1}
-  m_Center: {x: 0, y: 0, z: 0}
---- !u!114 &8605485584517581973
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 6726332823905808870}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: c4d5e6f7a8091b2c3d4e5f60718293a4, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  moveTriggerMask:
-    serializedVersion: 2
-    m_Bits: 64
 --- !u!1 &7045707959262978375
 GameObject:
   m_ObjectHideFlags: 0
@@ -1434,7 +1365,6 @@ GameObject:
   - component: {fileID: 2094468743373697594}
   - component: {fileID: 7633174719182490650}
   - component: {fileID: 7546035490822023939}
-  - component: {fileID: 8474207541164347158}
   - component: {fileID: 4515263327091502221}
   - component: {fileID: 3745428127655239812}
   m_Layer: 11
@@ -1462,7 +1392,6 @@ Transform:
   - {fileID: 4284040339609858357}
   - {fileID: 3268094528268593282}
   - {fileID: 5882214933823493543}
-  - {fileID: 2446329824527622155}
   - {fileID: 8967658384270852530}
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
@@ -1731,33 +1660,6 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   characterController: {fileID: 8386231063942977796}
   floorIndicatorCanvas: {fileID: 0}
---- !u!114 &8474207541164347158
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 8298653628802487545}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 7225efc126ce11c499510a90226ad2a9, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  depthAxisSource: 0
-  explicitAxisTransform: {fileID: 0}
-  explicitCamera: {fileID: 0}
-  maxShallowPushPerFrame: 0
-  shallowResolvedEpsilon: 0.02
-  routingEnabled: 1
-  routeProbe: {fileID: 8605485584517581973}
-  moveTriggerMask:
-    serializedVersion: 2
-    m_Bits: 4294967295
-  routeLeadDepth: 0.5
-  maxWallBottomAboveFeet: 0.45
-  maxWallTopBelowFeet: 0.05
-  blockRoutingWhenOccluded: 1
-  occlusionGate: {fileID: 0}
 --- !u!114 &4515263327091502221
 MonoBehaviour:
   m_ObjectHideFlags: 0

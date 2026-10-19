@@ -63,6 +63,12 @@ public sealed class FezGridTestPlayer : MonoBehaviour
     /// <summary>最後一次穩穩踩過的一般方塊；掉出地圖時拉回這裡。</summary>
     private FezGridBlock _lastStoodBlock;
 
+    private float _slideSpeed;
+    private bool _knockbackActive;
+    private const float KnockbackSlideSpeed = 8f;
+    private const float KnockbackFriction = 12f;
+    private const float KnockbackHopHeight = 0.55f;
+
     private readonly Transform[] _probeMarkers = new Transform[4];
     private readonly Renderer[] _probeRenderers = new Renderer[4];
     private readonly Vector3[] _probeWorld = new Vector3[4];
@@ -102,10 +108,13 @@ public sealed class FezGridTestPlayer : MonoBehaviour
             return;
         }
 
-        if (Input.GetKeyDown(KeyCode.Q) || Input.GetKeyDown(rotateLeftPad))
-            BeginRotate(1f);
-        else if (Input.GetKeyDown(KeyCode.E) || Input.GetKeyDown(rotateRightPad))
-            BeginRotate(-1f);
+        if (!_knockbackActive)
+        {
+            if (Input.GetKeyDown(KeyCode.Q) || Input.GetKeyDown(rotateLeftPad))
+                BeginRotate(1f);
+            else if (Input.GetKeyDown(KeyCode.E) || Input.GetKeyDown(rotateRightPad))
+                BeginRotate(-1f);
+        }
 
         if (_rotating)
             return;
@@ -143,11 +152,27 @@ public sealed class FezGridTestPlayer : MonoBehaviour
         else
             input = 0f;
 
+        if (_knockbackActive)
+        {
+            input = 0f;
+            inputMagnitude = 0f;
+            _currentSpeed = 0f;
+            _jumpBufferCounter = 0f;
+            _slideSpeed = Mathf.MoveTowards(_slideSpeed, 0f, KnockbackFriction * Time.deltaTime);
+            if (Mathf.Abs(_slideSpeed) <= 0.2f)
+            {
+                _slideSpeed = 0f;
+                _knockbackActive = false;
+            }
+        }
+
         var targetSpeed = inputMagnitude * moveSpeed;
         var accel = inputMagnitude > 0.01f ? acceleration : deceleration;
         _currentSpeed = Mathf.MoveTowards(_currentSpeed, targetSpeed, accel * Time.deltaTime);
         var moveDir = inputMagnitude > 0.01f ? transform.right * input : Vector3.zero;
-        var horizontal = moveDir * _currentSpeed;
+        var horizontal = _knockbackActive
+            ? axes.lateral * _slideSpeed
+            : moveDir * _currentSpeed;
 
         var jumpPressed = Input.GetButtonDown("Jump")
             || Input.GetKeyDown(KeyCode.Space)
@@ -158,6 +183,9 @@ public sealed class FezGridTestPlayer : MonoBehaviour
         var holdDrop = Input.GetKey(KeyCode.S)
             || Input.GetKey(KeyCode.DownArrow)
             || vertical <= downInputThreshold;
+        if (_knockbackActive)
+            jumpPressed = false;
+
         if (jumpPressed)
         {
             if (holdDrop && _coyoteCounter > 0f)
@@ -332,11 +360,34 @@ public sealed class FezGridTestPlayer : MonoBehaviour
                 _bypassSupport = support;
         }
 
-        // 移動後若已嵌進實體，往淺側推出。
-        Teleport(transform.position, axes);
+        // 站在頂面上時不往淺側推。轉視角後旁邊的方塊會被算進身體，這一推就是往淺處彈一下。
+        if (!FezGridProjection.IsFeetPlantedOn(support, transform.position))
+            Teleport(transform.position, axes);
 
         if (transform.position.y < -6f)
             RespawnOnLastStoodBlock(axes);
+    }
+
+    /// <summary>
+    /// 受擊沿畫面左右滑開，並只在這次擊退開始時往上彈一次。深度軸不動。
+    /// 滑行中不能操作；還貼在敵人身上時會維持側向速度，但不會再彈第二次。
+    /// </summary>
+    public void KnockbackFrom(Vector3 sourcePosition)
+    {
+        var axes = FezGridProjection.FromYaw(transform.eulerAngles.y);
+        var away = Vector3.Dot(transform.position - sourcePosition, axes.lateral);
+        var sign = Mathf.Abs(away) < 0.04f
+            ? (_slideSpeed > 0.1f || _currentSpeed > 0.1f ? -1f : 1f)
+            : Mathf.Sign(away);
+        _slideSpeed = sign * KnockbackSlideSpeed;
+        _currentSpeed = 0f;
+        if (_knockbackActive)
+            return;
+
+        _knockbackActive = true;
+        _jumpBufferCounter = 0f;
+        _coyoteCounter = 0f;
+        _velocity.y = Mathf.Sqrt(KnockbackHopHeight * -2f * gravity);
     }
 
     private void RememberStoodBlock(FezGridBlock support)
@@ -532,6 +583,23 @@ public sealed class FezGridTestPlayer : MonoBehaviour
         var targetDepth = wallBypass
             ? wallRoute
             : FezGridProjection.DepthOf(floor.Center, axes);
+        // 轉視角時人已在格子中心或更深的半格，就留在原地。
+        // 從下往上跳、只踩到上面那格的淺側半格時，收到這一格中心。
+        var pullOntoBlock = false;
+        if (!wallBypass && FezGridProjection.IsFeetPlantedOn(floor, transform.position))
+        {
+            var floorDepth = FezGridProjection.DepthOf(floor.Center, axes);
+            var playerDepth = FezGridProjection.DepthOf(transform.position, axes);
+            if (playerDepth < floorDepth - 0.08f)
+            {
+                targetDepth = floorDepth;
+                pullOntoBlock = true;
+            }
+            else
+            {
+                targetDepth = playerDepth;
+            }
+        }
 
         // 目標深度會讓身體嵌進實體時：繞行取消；一般換深度則留在原處。
         var probe = FezGridProjection.SnapToDepth(transform.position, targetDepth, axes);
@@ -558,13 +626,13 @@ public sealed class FezGridTestPlayer : MonoBehaviour
         var depthDiff = Mathf.Abs(targetDepth - currentDepth);
         var aboveFloor = floor != null && transform.position.y > floor.TopY + 0.15f;
         var falling = _velocity.y < -3.5f;
-        if (instant || holdDepth || aboveFloor || falling || depthDiff < 0.08f)
+        if (instant || holdDepth || aboveFloor || falling || pullOntoBlock || depthDiff < 0.08f)
         {
             _gliding = false;
             RebuildShell(axes, targetDepth, support);
             if (depthDiff >= 0.02f)
                 Teleport(probe, axes);
-            else
+            else if (!FezGridProjection.IsFeetPlantedOn(floor, transform.position))
                 Teleport(transform.position, axes);
             return true;
         }
@@ -638,15 +706,14 @@ public sealed class FezGridTestPlayer : MonoBehaviour
             : axes.depth == Vector3.back ? "-Z"
             : "-X";
 
-        GUI.Label(new Rect(16f, 16f, 720f, 160f),
+        ScreenHud.Draw(new Rect(16f, 16f, 760f, 164f),
             "格子投影測試（不影響 SampleScene）\n" +
             "A／D／左搖桿移動，空白／A／B 跳躍，Q／E／L1／R1 轉 90 度\n" +
             "S／下／搖桿下＋跳躍＝下落穿過\n" +
             $"目前深度軸 {depthName}\n" +
             "轉視角後依四角偵測點判定遮擋（綠＝未遮、紅＝被遮）。\n" +
             "一般方塊頂面可踩、側面可繞。遮片牆平常硬擋，繞行中暫時不碰撞。\n" +
-            "粉紅邊界牆＝看得見才硬擋、看不見可穿。\n" +
-            "S+空白＝下落穿過腳下那塊並繞到淺側。");
+            "粉紅邊界牆＝看得見才硬擋、看不見可穿。");
     }
 
     private void EnsureProbeMarkers()

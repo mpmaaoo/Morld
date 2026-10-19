@@ -1,114 +1,132 @@
 using UnityEngine;
-using Cinemachine;
+using UnityEngine.Serialization;
 
 namespace Lichronicle.Gameplay.Abilities
 {
     /// <summary>
-    /// 技能A：視角切換（類 FEZ）
-    /// 目前做法：
-    /// - 以玩家為中心，Y 軸每次旋轉 90 度。
-    /// - 可以接一個 CinemachineVirtualCamera，讓鏡頭跟著世界方向更新。
+    /// FEZ 式四向視角切換。每次觸發時，讓指定樞紐平滑旋轉一個固定角度。
     /// </summary>
     [DefaultExecutionOrder(-100)]
     public sealed class CameraRotationAbility : MonoBehaviour, IAbilityHandler
     {
-        [SerializeField] private Transform targetPivot; // 通常是玩家或玩家的空物件
+        [Tooltip("掛在 Player 根物件底下、只控制相機和移動平面的樞紐；不可指定 Player 根物件。")]
+        [FormerlySerializedAs("targetPivot")]
+        [SerializeField] private Transform cameraPivot;
         [SerializeField] private float stepDegrees = 90f;
         [SerializeField] private float rotateDuration = 0.35f;
-        [SerializeField] private CinemachineVirtualCamera virtualCamera;
-
         private bool _isRotating;
         private float _elapsed;
         private Quaternion _fromRot;
         private Quaternion _toRot;
+        private FezWorldViewState _worldViewState;
+        private FezRotationOcclusionGate _occlusionGate;
+
+        private void Awake()
+        {
+            CacheRelatedComponents();
+        }
+
+        private void OnEnable()
+        {
+            CacheRelatedComponents();
+        }
+
+        private void OnDisable()
+        {
+            // 元件若在動畫途中停用，也要解除深度移動鎖，避免玩家永久卡住。
+            if (!_isRotating)
+                return;
+
+            FinishRotation(true);
+        }
 
         private void Update()
         {
-            if (!_isRotating || targetPivot == null)
+            AdvanceRotation(Time.deltaTime);
+        }
+
+        public void AdvanceRotation(float deltaTime)
+        {
+            if (!_isRotating)
                 return;
 
-            _elapsed += Time.deltaTime;
-            var t = Mathf.Clamp01(_elapsed / rotateDuration);
-            targetPivot.rotation = Quaternion.Slerp(_fromRot, _toRot, t);
+            if (cameraPivot == null)
+            {
+                FinishRotation(false);
+                return;
+            }
 
-        if (t >= 1f)
-        {
-            _isRotating = false;
-            NotifyWorldViewState();
-            NotifyOcclusionGate();
-            NotifyOcclusionGateRotationState(false);
-            if (!IsPlayerDepthMovementBlocked())
-                FezBackgroundWallMoveTriggerFollower.ForceSyncAllPhases(0f);
-        }
+            _elapsed += Mathf.Clamp(deltaTime, 0f, 0.1f);
+            var duration = Mathf.Max(0f, rotateDuration);
+            var t = duration <= 0.0001f ? 1f : Mathf.Clamp01(_elapsed / duration);
+            cameraPivot.localRotation = Quaternion.Slerp(_fromRot, _toRot, t);
+
+            if (t >= 1f)
+                FinishRotation(true);
         }
 
         public void OnAbilityTriggered(AbilityDefinition definition, bool active)
         {
-            if (definition == null || definition.kind != AbilityKind.CameraRotate)
+            if (!isActiveAndEnabled || !active || definition == null || definition.kind != AbilityKind.CameraRotate)
+                return;
+            if (_isRotating || cameraPivot == null)
                 return;
 
-            if (!active || targetPivot == null)
-                return;
+            CacheRelatedComponents();
 
-            if (_isRotating)
+            var direction = Mathf.Approximately(definition.floatParam, 0f)
+                ? 1f
+                : Mathf.Sign(definition.floatParam);
+            var angleStep = Mathf.Abs(stepDegrees);
+            if (angleStep <= 0.0001f)
                 return;
-
-            var dir = Mathf.Sign(Mathf.Approximately(definition.floatParam, 0f) ? 1f : definition.floatParam);
 
             _isRotating = true;
-            NotifyOcclusionGateRotationState(true);
             _elapsed = 0f;
-            _fromRot = targetPivot.rotation;
-            var targetY = _fromRot.eulerAngles.y + stepDegrees * dir;
-            targetY = Mathf.Round(targetY / 90f) * 90f;
-            _toRot = Quaternion.Euler(0f, targetY, 0f);
+            _fromRot = cameraPivot.localRotation;
+
+            var currentYaw = cameraPivot.localEulerAngles.y;
+            var snappedYaw = Mathf.Round(currentYaw / 90f) * 90f;
+            var targetYaw = snappedYaw + angleStep * direction;
+            _toRot = Quaternion.Euler(0f, targetYaw, 0f);
+
+            if (_occlusionGate != null)
+                _occlusionGate.SetRotationInProgress(true);
+
+            if (rotateDuration <= 0.0001f)
+                FinishRotation(true);
         }
 
-        private void NotifyWorldViewState()
+        private void FinishRotation(bool applyTargetRotation)
         {
-            if (targetPivot == null)
+            if (applyTargetRotation && cameraPivot != null)
+                cameraPivot.localRotation = _toRot;
+
+            _isRotating = false;
+
+            if (_worldViewState != null)
+                _worldViewState.RefreshFromPivot();
+
+            if (_occlusionGate != null)
+                _occlusionGate.ScheduleViewRotationCompletion();
+        }
+
+        private void CacheRelatedComponents()
+        {
+            if (cameraPivot == null)
                 return;
-            var state = targetPivot.GetComponent<FezWorldViewState>();
-            if (state == null)
-                state = targetPivot.GetComponentInParent<FezWorldViewState>();
-            if (state == null)
-                state = targetPivot.GetComponentInChildren<FezWorldViewState>();
-            state?.RefreshFromPivot();
-        }
 
-        private void NotifyOcclusionGate()
-        {
-            if (targetPivot == null)
-                return;
+            _worldViewState = cameraPivot.GetComponent<FezWorldViewState>();
+            if (_worldViewState == null)
+                _worldViewState = cameraPivot.GetComponentInParent<FezWorldViewState>();
+            if (_worldViewState == null)
+                _worldViewState = cameraPivot.GetComponentInChildren<FezWorldViewState>();
 
-            var gate = FindOcclusionGate();
-            gate?.OnViewRotationCompleted();
-        }
-
-        private bool IsPlayerDepthMovementBlocked()
-        {
-            var gate = FindOcclusionGate();
-            return gate != null && gate.IsPlayerDepthMovementBlocked;
-        }
-
-        private void NotifyOcclusionGateRotationState(bool rotating)
-        {
-            var gate = FindOcclusionGate();
-            gate?.SetRotationInProgress(rotating);
-        }
-
-        private FezRotationOcclusionGate FindOcclusionGate()
-        {
-            if (targetPivot == null)
-                return null;
-
-            var gate = targetPivot.GetComponent<FezRotationOcclusionGate>();
-            if (gate == null)
-                gate = targetPivot.GetComponentInParent<FezRotationOcclusionGate>();
-            if (gate == null)
-                gate = targetPivot.GetComponentInChildren<FezRotationOcclusionGate>();
-            return gate;
+            _occlusionGate = cameraPivot.GetComponent<FezRotationOcclusionGate>();
+            if (_occlusionGate == null)
+                _occlusionGate = cameraPivot.GetComponentInParent<FezRotationOcclusionGate>();
+            if (_occlusionGate == null)
+                _occlusionGate = cameraPivot.GetComponentInChildren<FezRotationOcclusionGate>();
         }
     }
 }
-

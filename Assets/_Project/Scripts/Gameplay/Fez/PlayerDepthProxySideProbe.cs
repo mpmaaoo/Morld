@@ -33,6 +33,8 @@ public sealed class PlayerDepthProxySideProbe : MonoBehaviour
 
     private void Update()
     {
+        var motor = GetComponentInParent<PlayerController>();
+        if (motor != null && motor.isActiveAndEnabled) return;
         if (playerController == null || _probe == null)
             return;
 

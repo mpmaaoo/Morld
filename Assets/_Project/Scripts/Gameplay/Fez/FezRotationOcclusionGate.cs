@@ -12,9 +12,14 @@ using UnityEngine.Serialization;
 [DefaultExecutionOrder(190)]
 public sealed class FezRotationOcclusionGate : MonoBehaviour
 {
+    private const int InitialRaycastBufferSize = 16;
+    private const int MaximumRaycastBufferSize = 256;
+
     [Header("遮擋來源")]
-    [Tooltip("只用這些 layer 當遮擋物（平台本體 + 背景牆等）。")]
+    [Tooltip("停用『所有 Layer』時，僅使用這些 layer 當遮擋物。")]
     [SerializeField] private LayerMask occluderMask;
+    [Tooltip("啟用時判定所有 Layer 的 Collider，確保移動物件改變位置後仍參與視線遮擋；玩家自身階層會排除。")]
+    [SerializeField] private bool includeAllColliderLayers = true;
     [Tooltip("是否把 Trigger Collider 也算進遮擋（平台本體若是 isTrigger 需開啟）。")]
     [SerializeField] private bool includeTriggerOccluders = true;
     [Tooltip("Raycast 長度緩衝，避免點剛好落在遮擋表面邊界漏判。")]
@@ -42,25 +47,33 @@ public sealed class FezRotationOcclusionGate : MonoBehaviour
     [SerializeField] private Camera explicitCamera;
 
     CharacterController _cc;
+    RaycastHit[] _raycastHits = new RaycastHit[InitialRaycastBufferSize];
+    Transform[] _cachedOcclusionSamplePoints;
+    Transform[] _cachedWallRoutingSamplePoints;
     bool _occlusionCheckEnabled;
     bool _isBlockedByOcclusion;
-    int _rotationCompletedFrame = -1;
+    int _lastRefreshFrame = -1;
     bool _rotationInProgress;
+    bool _rotationCompletionPending;
+    bool _holdDepthUntilPlayerMoves;
+    static int _lastPhysicsSyncFrame = -1;
 
     public bool IsRotationInProgress => _rotationInProgress;
+    public event System.Action ViewRotationSettled;
 
     /// <summary>
     /// 旋轉進行中、或內圈遮擋時，禁止任何玩家深度修正（Snap／繞行／Proxy 跟隨）。
-    /// 每次查詢前會刷新一次，避免 Cinemachine 晚於 Update 更新相機造成快取過期。
+    /// 同一幀的多次查詢共用結果；LateUpdate 會在相機更新後強制刷新。
     /// </summary>
     public bool IsPlayerDepthMovementBlocked
     {
         get
         {
-            if (_rotationInProgress)
+            if (_rotationInProgress || _holdDepthUntilPlayerMoves)
                 return true;
 
-            RefreshOcclusionNow();
+            if (_lastRefreshFrame != Time.frameCount)
+                RefreshOcclusionNow();
             return _occlusionCheckEnabled && _isBlockedByOcclusion;
         }
     }
@@ -68,14 +81,12 @@ public sealed class FezRotationOcclusionGate : MonoBehaviour
     /// <inheritdoc cref="IsPlayerDepthMovementBlocked"/>
     public bool IsDepthSnapBlocked => IsPlayerDepthMovementBlocked;
 
-    /// <summary>內圈：鏡頭到玩家是否被 occluderMask 擋住（主判，優先於外圈）。</summary>
+    /// <summary>內圈：鏡頭到玩家是否被遮擋來源擋住（主判，優先於外圈）。</summary>
     public bool IsPlayerViewOccludedNow()
     {
-        var cam = ResolveViewCamera();
-        if (cam == null)
-            return true;
-
-        return IsInnerViewOccluded(cam.transform.position);
+        if (_lastRefreshFrame != Time.frameCount)
+            RefreshOcclusionNow();
+        return _isBlockedByOcclusion;
     }
 
     /// <summary>
@@ -92,6 +103,7 @@ public sealed class FezRotationOcclusionGate : MonoBehaviour
     /// <summary>僅外圈；呼叫前應先確認內圈未遮擋。</summary>
     public bool IsOuterViewOccludedForWallRouting(Vector3 depthAxis)
     {
+        SyncPhysicsTransformsIfNeeded();
         var cam = ResolveViewCamera();
         if (cam == null)
             return true;
@@ -108,6 +120,12 @@ public sealed class FezRotationOcclusionGate : MonoBehaviour
     {
         _cc = GetComponent<CharacterController>();
         TryAutoBindSampleRoots();
+        _cachedOcclusionSamplePoints = HasAnyPoint(occlusionSamplePoints)
+            ? occlusionSamplePoints
+            : CollectChildPoints(innerSampleRoot);
+        _cachedWallRoutingSamplePoints = HasAnyPoint(wallRoutingSamplePoints)
+            ? wallRoutingSamplePoints
+            : CollectWallRoutingSamplePoints(outerSampleRoot);
         _occlusionCheckEnabled = true;
     }
 
@@ -116,30 +134,50 @@ public sealed class FezRotationOcclusionGate : MonoBehaviour
         RefreshOcclusionNow();
     }
 
-    public void OnViewRotationCompleted()
+    public void ScheduleViewRotationCompletion()
     {
-        _rotationCompletedFrame = Time.frameCount;
         _occlusionCheckEnabled = true;
-        // 鏡頭已到位：先刷新遮擋，再解除旋轉鎖，之後才允許深度移動。
-        RefreshOcclusionNow();
-        _rotationInProgress = false;
+        // 旋轉後先保留玩家世界位置；只有玩家真的以輸入移動後才恢復深度對齊。
+        _holdDepthUntilPlayerMoves = true;
+        // 等 Cinemachine 更新完本幀相機後，再刷新遮擋並解鎖深度移動。
+        _rotationInProgress = true;
+        _rotationCompletionPending = true;
     }
 
     public void SetRotationInProgress(bool rotating)
     {
         _rotationInProgress = rotating;
+        if (rotating)
+            _rotationCompletionPending = false;
+    }
+
+    /// <summary>玩家經由控制輸入實際移動後，解除轉視角後的位置保護。</summary>
+    public void NotifyPlayerMoved()
+    {
+        _holdDepthUntilPlayerMoves = false;
     }
 
     void LateUpdate()
     {
         // 在 Cinemachine／Brain 更新相機之後再刷新，供同幀 Router／Snapper 使用。
+        _lastRefreshFrame = -1;
         RefreshOcclusionNow();
+
+        if (!_rotationCompletionPending)
+            return;
+
+        _rotationCompletionPending = false;
+        _rotationInProgress = false;
+        ViewRotationSettled?.Invoke();
     }
 
     public void RefreshOcclusionNow()
     {
+        _lastRefreshFrame = Time.frameCount;
         if (!_occlusionCheckEnabled && !_rotationInProgress)
             return;
+
+        SyncPhysicsTransformsIfNeeded();
 
         var cam = ResolveViewCamera();
         if (cam == null)
@@ -150,6 +188,15 @@ public sealed class FezRotationOcclusionGate : MonoBehaviour
         }
 
         _isBlockedByOcclusion = IsInnerViewOccluded(cam.transform.position);
+    }
+
+    private static void SyncPhysicsTransformsIfNeeded()
+    {
+        if (_lastPhysicsSyncFrame == Time.frameCount)
+            return;
+
+        Physics.SyncTransforms();
+        _lastPhysicsSyncFrame = Time.frameCount;
     }
 
     Camera ResolveViewCamera()
@@ -184,27 +231,26 @@ public sealed class FezRotationOcclusionGate : MonoBehaviour
 
     Transform[] GetOcclusionSamplePoints()
     {
-        if (HasAnyPoint(occlusionSamplePoints))
-            return occlusionSamplePoints;
-
-        return CollectChildPoints(innerSampleRoot);
+        return _cachedOcclusionSamplePoints;
     }
 
     Transform[] GetWallRoutingSamplePoints()
     {
-        if (HasAnyPoint(wallRoutingSamplePoints))
-            return wallRoutingSamplePoints;
+        return _cachedWallRoutingSamplePoints;
+    }
 
-        if (outerSampleRoot == null)
+    static Transform[] CollectWallRoutingSamplePoints(Transform root)
+    {
+        if (root == null)
             return null;
 
         var named = new Transform[4];
         var found = 0;
-        TryAddNamedPoint(outerSampleRoot, "LH", named, ref found);
-        TryAddNamedPoint(outerSampleRoot, "RH", named, ref found);
-        TryAddNamedPoint(outerSampleRoot, "RL", named, ref found);
-        TryAddNamedPoint(outerSampleRoot, "LL", named, ref found);
-        return found > 0 ? named : CollectChildPoints(outerSampleRoot);
+        TryAddNamedPoint(root, "LH", named, ref found);
+        TryAddNamedPoint(root, "RH", named, ref found);
+        TryAddNamedPoint(root, "RL", named, ref found);
+        TryAddNamedPoint(root, "LL", named, ref found);
+        return found > 0 ? named : CollectChildPoints(root);
     }
 
     static void TryAddNamedPoint(Transform root, string childName, Transform[] buffer, ref int count)
@@ -323,21 +369,41 @@ public sealed class FezRotationOcclusionGate : MonoBehaviour
         var triggerMode = includeTriggerOccluders
             ? QueryTriggerInteraction.Collide
             : QueryTriggerInteraction.Ignore;
-        var hits = Physics.RaycastAll(
+        var raycastMask = includeAllColliderLayers ? Physics.AllLayers : occluderMask.value;
+        var hitCount = Physics.RaycastNonAlloc(
             from,
             dir,
+            _raycastHits,
             len + raycastDistancePadding,
-            occluderMask,
+            raycastMask,
             triggerMode
         );
-        System.Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
 
-        for (var i = 0; i < hits.Length; i++)
+        // NonAlloc 不保證命中順序。緩衝區滿時擴大後重查，避免漏掉有效遮擋物。
+        while (hitCount == _raycastHits.Length && _raycastHits.Length < MaximumRaycastBufferSize)
         {
-            var hit = hits[i];
+            var newSize = Mathf.Min(_raycastHits.Length * 2, MaximumRaycastBufferSize);
+            _raycastHits = new RaycastHit[newSize];
+            hitCount = Physics.RaycastNonAlloc(
+                from,
+                dir,
+                _raycastHits,
+                len + raycastDistancePadding,
+                raycastMask,
+                triggerMode
+            );
+        }
+
+        // 極端密集場景達上限仍塞滿時採保守判定，防止穿過未被回傳的遮擋物。
+        if (hitCount == _raycastHits.Length)
+            return true;
+
+        for (var i = 0; i < hitCount; i++)
+        {
+            var hit = _raycastHits[i];
             if (hit.collider == null)
                 continue;
-            if (hit.collider.GetComponentInParent<FezBackgroundWallMoveTrigger>() != null)
+            if (hit.collider.transform == transform || hit.collider.transform.IsChildOf(transform))
                 continue;
             if (forWallRouting && IsBackgroundWallBodyCollider(hit.collider))
                 continue;
@@ -353,8 +419,6 @@ public sealed class FezRotationOcclusionGate : MonoBehaviour
     static bool IsBackgroundWallBodyCollider(Collider col)
     {
         if (col == null)
-            return false;
-        if (col.GetComponentInParent<FezBackgroundWallMoveTrigger>() != null)
             return false;
         return col.GetComponentInParent<FezBackgroundWall>() != null;
     }

@@ -59,14 +59,6 @@ public sealed class FezPlatformDepthSnapSuppressZone : MonoBehaviour
         if (zone.Intersects(wall.GetBodyWorldBounds()))
             return true;
 
-        var triggers = wall.GetMoveTriggerColliders();
-        for (var i = 0; i < triggers.Length; i++)
-        {
-            var col = triggers[i];
-            if (col != null && col.enabled && zone.Intersects(col.bounds))
-                return true;
-        }
-
         return zone.Intersects(wall.GetRoutingColumnBounds());
     }
 

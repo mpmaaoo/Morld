@@ -23,14 +23,13 @@ public sealed class FezPlayerDepthSnapper : MonoBehaviour
     [SerializeField] private float snapEpsilon = 0.001f;
     [SerializeField] private float maxSnapDepthStep = 1.5f;
     [SerializeField] private bool resolveShallowOnlyWhenOverlapping = true;
+    [Tooltip("停用時不會因玩家卡入牆／平台而自動沿深度軸推到淺側。")]
+    [SerializeField] private bool allowAutomaticOverlapShallowCorrection;
     [SerializeField] private LayerMask overlapResolveMask = ~0;
     [SerializeField] private float shallowOverlapBias = 0.05f;
 
     [Header("遮擋停用（旋轉後）")]
     [SerializeField] private FezRotationOcclusionGate occlusionGate;
-
-    [Header("背景牆（淺側繞行）")]
-    [SerializeField] private FezPlayerBackgroundWallRouter backgroundWallRouter;
 
     private CharacterController _cc;
 
@@ -39,12 +38,11 @@ public sealed class FezPlayerDepthSnapper : MonoBehaviour
         _cc = GetComponent<CharacterController>();
         if (occlusionGate == null)
             occlusionGate = GetComponent<FezRotationOcclusionGate>();
-        if (backgroundWallRouter == null)
-            backgroundWallRouter = GetComponent<FezPlayerBackgroundWallRouter>();
     }
 
     private void LateUpdate()
     {
+        if (TryGetComponent<PlayerController>(out var motor) && motor.isActiveAndEnabled) return;
         if (_cc == null)
             return;
 
@@ -63,7 +61,7 @@ public sealed class FezPlayerDepthSnapper : MonoBehaviour
             if (TryGetShallowestPlatformDepthUnderFeet(viewForward, out var bestDepth))
             {
                 var deltaDepth = Mathf.Clamp(bestDepth - playerDepth, -Mathf.Max(0.01f, maxSnapDepthStep), Mathf.Max(0.01f, maxSnapDepthStep));
-                if (Mathf.Abs(deltaDepth) >= snapEpsilon && IsDepthDeltaAllowed(deltaDepth, viewForward))
+                if (Mathf.Abs(deltaDepth) >= snapEpsilon)
                 {
                     var desiredMove = viewForward * deltaDepth;
                     if (snapSpeed <= 0f)
@@ -76,35 +74,14 @@ public sealed class FezPlayerDepthSnapper : MonoBehaviour
 
         FezDepthProxyFollower.SyncAllAfterPlayerDepthSnap(Time.deltaTime);
 
-        if (resolveShallowOnlyWhenOverlapping && !IsOcclusionBlocked())
+        if (allowAutomaticOverlapShallowCorrection
+            && resolveShallowOnlyWhenOverlapping
+            && !IsOcclusionBlocked())
             ResolveOverlapShallow(viewForward);
     }
 
     private bool IsOcclusionBlocked() =>
         occlusionGate != null && occlusionGate.IsPlayerDepthMovementBlocked;
-
-    /// <summary>
-    /// 無硬抑制時雙向皆可；硬抑制啟用時只允許往淺（deltaDepth &lt; 0），
-    /// 且需玩家已位於與抑制區重疊之牆的淺側。
-    /// </summary>
-    private bool IsDepthDeltaAllowed(float deltaDepth, Vector3 viewForward)
-    {
-        if (backgroundWallRouter == null || !backgroundWallRouter.IsDepthSnapHardSuppressed())
-            return true;
-
-        // 往深：一律擋
-        if (deltaDepth > snapEpsilon)
-            return false;
-
-        // 往淺：僅在已過牆淺側時放行
-        if (deltaDepth < -snapEpsilon)
-            return backgroundWallRouter.IsPlayerAlreadyShallowOfOverlappingSuppressWalls(viewForward);
-
-        return true;
-    }
-
-    bool ShouldSuppressDepthSnapForSurface(FezDepthProxySurface surface) =>
-        backgroundWallRouter != null && backgroundWallRouter.ShouldSuppressDepthSnapForPlatform(surface);
 
     internal void CollectFootPlatformSurfaces(List<FezDepthProxySurface> results)
     {
@@ -127,9 +104,6 @@ public sealed class FezPlayerDepthSnapper : MonoBehaviour
             var col = overlaps[i];
             if (col == null || !IsDepthProxyCollider(col))
                 continue;
-            if (col.GetComponentInParent<FezBackgroundWallMoveTrigger>() != null)
-                continue;
-
             var surface = col.GetComponentInParent<FezDepthProxySurface>();
             if (surface == null || results.Contains(surface))
                 continue;
@@ -157,11 +131,8 @@ public sealed class FezPlayerDepthSnapper : MonoBehaviour
             var col = overlaps[i];
             if (col == null || !IsDepthProxyCollider(col))
                 continue;
-            if (col.GetComponentInParent<FezBackgroundWallMoveTrigger>() != null)
-                continue;
-
             var surface = col.GetComponentInParent<FezDepthProxySurface>();
-            if (surface == null || ShouldSuppressDepthSnapForSurface(surface))
+            if (surface == null)
                 continue;
 
             var depth = FezDepthAxis.DepthOf(surface.GetPlatformDepthWorldPos(), viewForward);
@@ -191,7 +162,7 @@ public sealed class FezPlayerDepthSnapper : MonoBehaviour
                 continue;
 
             var surface = col.GetComponentInParent<FezDepthProxySurface>();
-            if (surface == null || ShouldSuppressDepthSnapForSurface(surface))
+            if (surface == null)
                 continue;
 
             Vector3 dir;
@@ -225,9 +196,6 @@ public sealed class FezPlayerDepthSnapper : MonoBehaviour
             return;
 
         deltaDepth = Mathf.Clamp(deltaDepth, -Mathf.Max(0.01f, maxSnapDepthStep), Mathf.Max(0.01f, maxSnapDepthStep));
-        if (!IsDepthDeltaAllowed(deltaDepth, viewForward))
-            return;
-
         _cc.Move(viewForward * deltaDepth);
     }
 

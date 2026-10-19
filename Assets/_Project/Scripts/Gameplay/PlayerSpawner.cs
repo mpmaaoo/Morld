@@ -32,7 +32,6 @@ public sealed class PlayerSpawner : MonoBehaviour
 
     [Header("Follower 重綁")]
     [SerializeField] private bool rewireDepthProxyFollowers = true;
-    [SerializeField] private bool rewireBackgroundWallMoveFollowers = true;
 
     /// <summary>本場景目前作用中的玩家（暖機完成後）。</summary>
     public static GameObject ActivePlayer { get; private set; }
@@ -79,9 +78,6 @@ public sealed class PlayerSpawner : MonoBehaviour
         if (rewireDepthProxyFollowers)
             RewireDepthProxyFollowers(player.transform);
 
-        if (rewireBackgroundWallMoveFollowers)
-            RewireBackgroundWallMoveFollowers(player.transform);
-
         ActivePlayer = player;
     }
 
@@ -117,7 +113,10 @@ public sealed class PlayerSpawner : MonoBehaviour
         Physics.SyncTransforms();
 
         if (cc != null)
+        {
             cc.enabled = true;
+            FezOneWayPlatform.InvalidatePlayerCollisionState(cc);
+        }
     }
 
     private static void StabilizeAndSyncFez(GameObject player)
@@ -128,13 +127,13 @@ public sealed class PlayerSpawner : MonoBehaviour
             cc.enabled = false;
             Physics.SyncTransforms();
             cc.enabled = true;
+            FezOneWayPlatform.InvalidatePlayerCollisionState(cc);
         }
 
         var viewState = player.GetComponent<FezWorldViewState>();
         if (viewState != null)
             viewState.RefreshFromPivot();
 
-        FezBackgroundWallMoveTriggerFollower.ForceSyncAllPhases(0f);
         FezDepthProxyFollower.ForceSyncAllPhases(0f);
     }
 
@@ -148,13 +147,4 @@ public sealed class PlayerSpawner : MonoBehaviour
         }
     }
 
-    private static void RewireBackgroundWallMoveFollowers(Transform playerRoot)
-    {
-        var followers = Object.FindObjectsOfType<FezBackgroundWallMoveTriggerFollower>(includeInactive: true);
-        for (var i = 0; i < followers.Length; i++)
-        {
-            if (followers[i] != null)
-                followers[i].SetPlayerRoot(playerRoot);
-        }
-    }
 }

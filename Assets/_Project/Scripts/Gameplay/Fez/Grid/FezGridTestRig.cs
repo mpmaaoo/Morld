@@ -36,6 +36,7 @@ public sealed class FezGridTestRig : MonoBehaviour
 
         var player = SpawnPlayer(spawn, spawnRot);
         player.Bind(map, shell);
+        AttachCombatTest(player, spawn, spawnRot);
 
         var camera = Camera.main;
         if (camera == null)
@@ -104,6 +105,39 @@ public sealed class FezGridTestRig : MonoBehaviour
             renderer.sharedMaterial = new Material(shader) { color = new Color(0.95f, 0.95f, 0.9f) };
 
         return player;
+    }
+
+    private static void AttachCombatTest(FezGridTestPlayer player, Vector3 spawn, Quaternion rotation)
+    {
+        var host = player.gameObject;
+        var health = host.GetComponent<Health>();
+        if (health == null)
+            health = host.AddComponent<Health>();
+        health.SetMax(100, true);
+        if (host.GetComponent<HitFeedback>() == null)
+            host.AddComponent<HitFeedback>();
+        if (host.GetComponent<HealthDebugInput>() == null)
+            host.AddComponent<HealthDebugInput>();
+
+        var root = new GameObject("TestMonster");
+        root.transform.SetPositionAndRotation(spawn + rotation * Vector3.right * 3f, rotation);
+
+        var body = GameObject.CreatePrimitive(PrimitiveType.Capsule);
+        body.name = "Body";
+        body.transform.SetParent(root.transform, false);
+        body.transform.localPosition = new Vector3(0f, 0.8f, 0f);
+        var hitbox = body.GetComponent<CapsuleCollider>();
+        if (hitbox != null)
+            hitbox.isTrigger = true;
+        var renderer = body.GetComponent<Renderer>();
+        var shader = Shader.Find("Unlit/Color");
+        if (renderer != null && shader != null)
+            renderer.sharedMaterial = new Material(shader) { color = new Color(0.85f, 0.25f, 0.3f) };
+
+        var monsterHealth = root.AddComponent<Health>();
+        monsterHealth.SetMax(60, true);
+        root.AddComponent<HitFeedback>();
+        root.AddComponent<Monster>();
     }
 
     private void ResolveSpawn(FezGridMap map, out Vector3 position, out Quaternion rotation)

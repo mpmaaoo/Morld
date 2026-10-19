@@ -87,6 +87,7 @@ public static class FezGridProjection
 
         var bestGap = float.PositiveInfinity;
         var bestDepthScore = float.PositiveInfinity;
+        var plantedFloor = false;
 
         foreach (var block in map.Blocks)
         {
@@ -95,6 +96,23 @@ public static class FezGridProjection
                 continue;
 
             if (!IsFloorCandidate(map, block, feet, axes, maxDrop, out var gap))
+                continue;
+
+            // 腳還踩在這格上時，不要被同一畫面柱裡更淺的地板拉走。轉視角才不會往淺處彈。
+            var planted = IsFeetPlantedOn(block, feet);
+            if (planted)
+            {
+                if (!plantedFloor || gap < bestGap)
+                {
+                    plantedFloor = true;
+                    bestGap = gap;
+                    floor = block;
+                }
+
+                continue;
+            }
+
+            if (plantedFloor)
                 continue;
 
             if (covered)
@@ -329,6 +347,24 @@ public static class FezGridProjection
 
         gap = feet.y - block.TopY;
         return gap >= -0.08f && gap <= maxDrop;
+    }
+
+    /// <summary>
+    /// 腳的水平位置還在這格裡，而且高度就在頂面附近。
+    /// </summary>
+    public static bool IsFeetPlantedOn(FezGridBlock block, Vector3 feet)
+    {
+        if (block == null || !block.Solid || IsIgnoredFloor(block))
+            return false;
+
+        var cell = block.Cell;
+        if (feet.x < cell.x - 0.02f || feet.x > cell.x + 1.02f)
+            return false;
+        if (feet.z < cell.z - 0.02f || feet.z > cell.z + 1.02f)
+            return false;
+
+        var gap = feet.y - block.TopY;
+        return gap >= -0.15f && gap <= 0.35f;
     }
 
     public static Vector3 SnapDepth(Vector3 feet, FezGridBlock floor, Axes axes)

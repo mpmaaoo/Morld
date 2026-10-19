@@ -8,6 +8,119 @@ using UnityEngine;
 [DisallowMultipleComponent]
 public sealed class FezPlatformViewOcclusion : MonoBehaviour
 {
+    private static RaycastHit[] _footHits = new RaycastHit[32];
+
+    /// <summary>
+    /// Returns true only when at least the requested fraction of the player's silhouette is
+    /// visible from the committed view. Sampling is kept in the view plane so depth alignment
+    /// cannot make a mostly hidden player pop onto a foreground platform.
+    /// </summary>
+    public static bool IsCharacterMostlyVisible(CharacterController controller, Vector3 axis,
+        float requiredVisibleFraction = 0.6f)
+    {
+        if (controller == null || !controller.enabled) return false;
+        axis = axis.sqrMagnitude > 0.0001f ? axis.normalized : Vector3.forward;
+        Bounds bounds = controller.bounds;
+        Vector3 right = Vector3.Cross(Vector3.up, axis).normalized;
+        if (right.sqrMagnitude < 0.5f) right = Vector3.right;
+
+        const int columns = 5;
+        const int rows = 6;
+        int visible = 0;
+        for (int row = 0; row < rows; row++)
+        for (int column = 0; column < columns; column++)
+        {
+            float x = Mathf.Lerp(-0.82f, 0.82f, (column + 0.5f) / columns);
+            float y = Mathf.Lerp(-0.88f, 0.88f, (row + 0.5f) / rows);
+            Vector3 point = bounds.center + right * (bounds.extents.x * x)
+                + Vector3.up * (bounds.extents.y * y);
+            if (!IsPointOccludedFromView(controller.transform, point, axis)) visible++;
+        }
+        return visible / (float)(columns * rows) >= Mathf.Clamp01(requiredVisibleFraction);
+    }
+
+    private static bool IsPointOccludedFromView(Transform player, Vector3 point, Vector3 axis)
+    {
+        const float distance = 2000f;
+        Vector3 origin = point - axis * distance;
+        int count;
+        while (true)
+        {
+            count = Physics.RaycastNonAlloc(origin, axis, _footHits, distance,
+                Physics.AllLayers, QueryTriggerInteraction.Collide);
+            if (count < _footHits.Length) break;
+            if (_footHits.Length >= 4096) return true;
+            System.Array.Resize(ref _footHits, _footHits.Length * 2);
+        }
+        for (int i = 0; i < count; i++)
+        {
+            var col = _footHits[i].collider;
+            if (col == null || col.transform == player || col.transform.IsChildOf(player)) continue;
+            if (IsNonVisualMoveCollider(col) || col.GetComponentInParent<PlayerController>() != null) continue;
+            if (col.GetComponentInParent<FezPlatformDepthSnapSuppressZone>() != null ||
+                col.GetComponentInParent<FezPlayerDepthSnapSuppressZone>() != null) continue;
+            // Trigger volumes describe interaction, not visible geometry.
+            if (col.isTrigger && col.GetComponent<Renderer>() == null &&
+                col.GetComponentInParent<Renderer>() == null) continue;
+            if (_footHits[i].distance < distance - 0.025f) return true;
+        }
+        return false;
+    }
+
+    /// <summary>Visibility at the actual foot segment in the committed orthographic view.</summary>
+    public static bool IsFootVisible(Transform player, Vector3 point, Vector3 axis, Collider[] own)
+    {
+        // Just inside the top edge: a foreground block at the same height hides the rear block.
+        point.y -= 0.005f;
+        const float distance = 2000f;
+        Vector3 origin = point - axis * distance;
+        int count;
+        while (true)
+        {
+            count = Physics.RaycastNonAlloc(origin, axis, _footHits, distance,
+                Physics.AllLayers, QueryTriggerInteraction.Collide);
+            if (count < _footHits.Length) break;
+            if (_footHits.Length >= 4096) return false;
+            System.Array.Resize(ref _footHits, _footHits.Length * 2);
+        }
+        // Visibility ends at the candidate's camera-facing surface, not at its depth center.
+        // Coincident platform copies otherwise occlude each other and both reject landing.
+        float surfaceDistance = distance;
+        bool foundSurface = false;
+        for (int i = 0; i < count; i++)
+        {
+            var col = _footHits[i].collider;
+            if (col == null || IsNonVisualMoveCollider(col)) continue;
+            for (int j = 0; j < own.Length; j++)
+                if (own[j] == col)
+                {
+                    surfaceDistance = Mathf.Min(surfaceDistance, _footHits[i].distance);
+                    foundSurface = true;
+                    break;
+                }
+        }
+        float occluderLimit = surfaceDistance - (foundSurface ? 0.001f : 0.025f);
+        for (int i = 0; i < count; i++)
+        {
+            var col = _footHits[i].collider;
+            if (col == null || col.transform.IsChildOf(player) || col.transform == player) continue;
+            bool isOwn = false;
+            for (int j = 0; j < own.Length; j++)
+                if (own[j] == col) { isOwn = true; break; }
+            if (isOwn || IsNonVisualMoveCollider(col)) continue;
+            if (col.GetComponentInParent<PlayerController>() != null) continue;
+            if (col.GetComponentInParent<FezPlatformDepthSnapSuppressZone>() != null ||
+                col.GetComponentInParent<FezPlayerDepthSnapSuppressZone>() != null) continue;
+            // Match the silhouette query: invisible interaction volumes cannot hide a floor.
+            if (col.isTrigger && col.GetComponent<Renderer>() == null &&
+                col.GetComponentInParent<Renderer>() == null) continue;
+            // Equal-depth surfaces remain visible. A genuinely nearer wall or block still hides
+            // the candidate, including overlapping geometry whose front face is nearer.
+            if (_footHits[i].distance >= occluderLimit) continue;
+            return false;
+        }
+        return true;
+    }
     [Header("遮擋來源")]
     [Tooltip("會擋住視線的 Layer（通常與玩家 FezRotationOcclusionGate 相同：平台本體等）。")]
     [SerializeField] private LayerMask occluderMask;
@@ -124,7 +237,7 @@ public sealed class FezPlatformViewOcclusion : MonoBehaviour
             if (h.collider != null && IsOwnPlatformCollider(h.collider))
                 continue;
 
-            // 移動／跟隨用隱形箱不算視線遮擋（牆 MoveTrigger、平台 DepthProxy）
+            // 跟隨玩家深度的隱形碰撞箱不算視線遮擋。
             if (IsNonVisualMoveCollider(h.collider))
                 continue;
 
@@ -150,7 +263,9 @@ public sealed class FezPlatformViewOcclusion : MonoBehaviour
         if (col == null)
             return true;
 
-        if (col.GetComponentInParent<FezBackgroundWallMoveTrigger>() != null)
+        // A disabled visual with a live collider still participates in physics, but cannot hide a floor or silhouette.
+        var visual = col.GetComponentInParent<Renderer>();
+        if (visual != null && (!visual.enabled || visual.forceRenderingOff))
             return true;
 
         // 其他平台的 DepthProxy 同樣不可見；本平台已由 IsOwnPlatformCollider 略過
@@ -160,3 +275,4 @@ public sealed class FezPlatformViewOcclusion : MonoBehaviour
         return false;
     }
 }
+

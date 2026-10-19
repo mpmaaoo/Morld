@@ -210,21 +210,6 @@ public sealed class FezGridMap : MonoBehaviour
         if (visual == null)
             return;
 
-        // 依依賴順序拆：Follower → MoveTrigger → Collider。
-        var followers = visual.GetComponentsInChildren<FezBackgroundWallMoveTriggerFollower>(true);
-        for (var i = 0; i < followers.Length; i++)
-        {
-            if (followers[i] != null)
-                Object.DestroyImmediate(followers[i]);
-        }
-
-        var moveTriggers = visual.GetComponentsInChildren<FezBackgroundWallMoveTrigger>(true);
-        for (var i = 0; i < moveTriggers.Length; i++)
-        {
-            if (moveTriggers[i] != null)
-                Object.DestroyImmediate(moveTriggers[i]);
-        }
-
         var behaviours = visual.GetComponentsInChildren<MonoBehaviour>(true);
         for (var i = 0; i < behaviours.Length; i++)
         {

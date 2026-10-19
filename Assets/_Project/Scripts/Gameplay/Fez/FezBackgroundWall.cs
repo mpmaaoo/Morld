@@ -2,29 +2,26 @@ using System.Collections.Generic;
 using UnityEngine;
 
 /// <summary>
-/// 背景牆：玩家須在 2D 視角下從淺側經過；繞行由子物件 <see cref="FezBackgroundWallMoveTrigger"/> 偵測。
-/// 被牆體遮住視線時不自動推淺（由 <see cref="FezPlayerBackgroundWallRouter"/> 判定）。
+/// 背景牆本體。深度與遮擋用牆自己的碰撞器，不再另掛移動用的觸發箱。
 /// </summary>
 [DisallowMultipleComponent]
 public sealed class FezBackgroundWall : MonoBehaviour
 {
     private static readonly List<FezBackgroundWall> Registered = new List<FezBackgroundWall>(32);
+    internal static IReadOnlyList<FezBackgroundWall> ActiveWalls => Registered;
 
-    [Tooltip("牆本體碰撞器（算淺面深度、遮擋）；不含 MoveTrigger 子物件。")]
+    [Tooltip("牆本體碰撞器（算淺面深度、遮擋）。")]
     [SerializeField] private Collider[] wallBodyColliders;
 
     [Tooltip("繞行目標：本體淺面再淺這麼多（沿深度軸，通常 1 格）。")]
     [SerializeField] private float shallowRouteGridStep = 1f;
 
-    [Tooltip("牆方塊幾何中心（MoveTrigger 父物件，例如 WallCenter）；留空則嘗試 Find(\"WallCenter\")。")]
+    [Tooltip("牆方塊幾何中心（例如 WallCenter）；留空則嘗試 Find(\"WallCenter\")。")]
     [SerializeField] private Transform depthReference;
 
-    private readonly List<FezBackgroundWallMoveTrigger> _moveTriggers = new List<FezBackgroundWallMoveTrigger>(4);
-
     public float ShallowRouteGridStep => shallowRouteGridStep;
-    public bool HasMoveTrigger => _moveTriggers.Count > 0;
 
-    /// <summary>深度／MoveTrigger 柱位的幾何中心。</summary>
+    /// <summary>牆方塊的幾何中心。</summary>
     public Transform DepthReference
     {
         get
@@ -33,18 +30,6 @@ public sealed class FezBackgroundWall : MonoBehaviour
                 return depthReference;
             return transform.Find("WallCenter");
         }
-    }
-
-    internal void RegisterMoveTrigger(FezBackgroundWallMoveTrigger trigger)
-    {
-        if (trigger != null && !_moveTriggers.Contains(trigger))
-            _moveTriggers.Add(trigger);
-    }
-
-    internal void UnregisterMoveTrigger(FezBackgroundWallMoveTrigger trigger)
-    {
-        if (trigger != null)
-            _moveTriggers.Remove(trigger);
     }
 
     private void OnEnable()
@@ -157,25 +142,6 @@ public sealed class FezBackgroundWall : MonoBehaviour
             && a.min.z < b.max.z && a.max.z > b.min.z;
     }
 
-    public Collider[] GetMoveTriggerColliders()
-    {
-        if (_moveTriggers.Count == 0)
-            return System.Array.Empty<Collider>();
-
-        var list = new List<Collider>(_moveTriggers.Count);
-        for (var i = 0; i < _moveTriggers.Count; i++)
-        {
-            var t = _moveTriggers[i];
-            if (t == null || !t.isActiveAndEnabled)
-                continue;
-            var col = t.TriggerCollider;
-            if (col != null && col.enabled)
-                list.Add(col);
-        }
-
-        return list.ToArray();
-    }
-
     public Collider[] GetBodyColliders()
     {
         if (wallBodyColliders != null && wallBodyColliders.Length > 0)
@@ -183,35 +149,6 @@ public sealed class FezBackgroundWall : MonoBehaviour
 
         var self = GetComponent<Collider>();
         return self != null ? new[] { self } : System.Array.Empty<Collider>();
-    }
-
-    public static void CollectWallsWithMoveTriggerOverlap(Bounds queryBounds, List<FezBackgroundWall> results)
-    {
-        results.Clear();
-        for (var i = 0; i < Registered.Count; i++)
-        {
-            var w = Registered[i];
-            if (w == null || !w.isActiveAndEnabled || !w.HasMoveTrigger)
-                continue;
-
-            if (queryBounds.Intersects(w.GetBodyWorldBounds())
-                || w.IntersectsAnyMoveTrigger(queryBounds)
-                || w.IntersectsRoutingColumn(queryBounds))
-                results.Add(w);
-        }
-    }
-
-    public bool IntersectsAnyMoveTrigger(Bounds queryBounds)
-    {
-        var cols = GetMoveTriggerColliders();
-        for (var i = 0; i < cols.Length; i++)
-        {
-            var col = cols[i];
-            if (col != null && queryBounds.Intersects(col.bounds))
-                return true;
-        }
-
-        return false;
     }
 
     internal static float ProjectBoundsShallowDepth(Bounds b, Vector3 vf)

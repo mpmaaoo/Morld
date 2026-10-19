@@ -44,6 +44,7 @@ public sealed class PlayerSpineAnimator : MonoBehaviour
     Transform _movementPlane;
     string _currentAnim = string.Empty;
     float _facingScaleX = 1f;
+    Quaternion _viewRotationOffset;
 
     void Awake()
     {
@@ -53,6 +54,8 @@ public sealed class PlayerSpineAnimator : MonoBehaviour
         _controller = GetComponentInParent<CharacterController>();
         if (_player != null)
             _movementPlane = _player.movementPlane;
+        if (_movementPlane != null)
+            _viewRotationOffset = Quaternion.Inverse(_movementPlane.rotation) * transform.rotation;
 
         ApplySpinePhysicsSettings();
     }
@@ -87,14 +90,23 @@ public sealed class PlayerSpineAnimator : MonoBehaviour
         if (_skeletonAnimation == null)
             return;
 
+        SyncViewFacing();
         UpdateFacing();
         UpdateAnimation();
         UpdateWalkTimeScale();
     }
 
+    // Rotate only the artwork. The capsule, foothold and camera pivot keep their own transforms.
+    public void SyncViewFacing()
+    {
+        if (_movementPlane != null && transform != _movementPlane &&
+            (_player == null || transform != _player.transform))
+            transform.rotation = _movementPlane.rotation * _viewRotationOffset;
+    }
+
     void UpdateAnimation()
     {
-        bool grounded = _controller != null && _controller.isGrounded;
+        bool grounded = _player != null ? _player.IsGrounded : _controller != null && _controller.isGrounded;
         float vy = GetVerticalSpeed();
 
         if (!grounded)
@@ -115,10 +127,11 @@ public sealed class PlayerSpineAnimator : MonoBehaviour
 
     float GetHorizontalSpeed()
     {
+        if (_player != null) return _player.WalkingSpeed;
         if (_controller == null)
             return 0f;
 
-        Vector3 v = _controller.velocity;
+        Vector3 v = _player != null ? _player.Velocity : _controller.velocity;
         if (_movementPlane != null)
         {
             Vector3 right = _movementPlane.right;
@@ -135,7 +148,7 @@ public sealed class PlayerSpineAnimator : MonoBehaviour
 
     float GetVerticalSpeed()
     {
-        return _controller != null ? _controller.velocity.y : 0f;
+        return _player != null ? _player.Velocity.y : _controller != null ? _controller.velocity.y : 0f;
     }
 
     void UpdateFacing()
