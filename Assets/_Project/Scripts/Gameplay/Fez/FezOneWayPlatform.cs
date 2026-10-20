@@ -215,7 +215,8 @@ public sealed class FezOneWayPlatform : MonoBehaviour
 
     public static bool FindFloor(CharacterController player, Vector3 startFeet, Vector3 endFeet,
         Vector3 depthAxis, float tolerance, out SupportHit best, float ignoredTop = float.PositiveInfinity,
-        bool characterMostlyVisible = true, float lateralMargin = 0f, bool preserveDepth = false)
+        bool characterMostlyVisible = true, float lateralMargin = 0f, bool preserveDepth = false,
+        System.Predicate<SupportHit> reachable = null)
     {
         best = default;
         float top = float.NegativeInfinity;
@@ -225,7 +226,7 @@ public sealed class FezOneWayPlatform : MonoBehaviour
             for (int i = 0; i < CandidatePlatforms.Count; i++)
                 ConsiderProjectedFloor(player, CandidatePlatforms[i], startFeet, endFeet,
                     depthAxis, tolerance, ignoredTop, characterMostlyVisible, lateralMargin, preserveDepth,
-                    ref top, ref best);
+                    ref top, ref best, reachable);
         }
         else
         {
@@ -234,14 +235,15 @@ public sealed class FezOneWayPlatform : MonoBehaviour
             foreach (var platform in Registered)
                 ConsiderProjectedFloor(player, platform, startFeet, endFeet, depthAxis,
                     tolerance, ignoredTop, characterMostlyVisible, lateralMargin, preserveDepth,
-                    ref top, ref best);
+                    ref top, ref best, reachable);
         }
         return best.platform != null;
     }
 
     private static void ConsiderProjectedFloor(CharacterController player, FezOneWayPlatform platform,
         Vector3 startFeet, Vector3 endFeet, Vector3 depthAxis, float tolerance, float ignoredTop,
-        bool characterMostlyVisible, float lateralMargin, bool preserveDepth, ref float top, ref SupportHit best)
+        bool characterMostlyVisible, float lateralMargin, bool preserveDepth, ref float top, ref SupportHit best,
+        System.Predicate<SupportHit> reachable)
     {
         if (platform == null || !platform.isActiveAndEnabled ||
             !platform.TrySample(endFeet, depthAxis, out var hit,
@@ -252,6 +254,8 @@ public sealed class FezOneWayPlatform : MonoBehaviour
         if (!characterMostlyVisible && Mathf.Abs(requiredDepthShift) > tolerance) return;
         if (!FezPlatformViewOcclusion.IsFootVisible(player.transform, hit.point,
                 depthAxis, platform._all)) return;
+        // A blocked best-looking floor must not suppress another reachable landing.
+        if (reachable != null && !reachable(hit)) return;
         if (Mathf.Abs(hit.point.y - top) < 0.0001f && best.platform != null)
         {
             float candidateDepth = preserveDepth ? Mathf.Abs(requiredDepthShift) : Vector3.Dot(hit.point, depthAxis);
@@ -446,7 +450,8 @@ public sealed class FezOneWayPlatform : MonoBehaviour
             float side = Vector3.Dot(endFeet - b.center, right);
             float half = Mathf.Abs(right.x) * b.extents.x + Mathf.Abs(right.z) * b.extents.z;
             if (Mathf.Abs(side) > half + lateralMargin) continue;
-            float clampedSide = Mathf.Clamp(side, -half, half);
+            float sampleHalf = Mathf.Max(0f, half - 0.005f);
+            float clampedSide = Mathf.Clamp(side, -sampleHalf, sampleHalf);
             Vector3 samplePoint = endFeet + right * (clampedSide - side);
             Vector3 origin = new Vector3(samplePoint.x, b.max.y + 0.1f, samplePoint.z);
             if (!body.Raycast(new Ray(origin, Vector3.down), out var hit, b.size.y + 0.2f)) continue;
@@ -474,7 +479,10 @@ public sealed class FezOneWayPlatform : MonoBehaviour
             float side = Vector3.Dot(foot - bounds.center, right);
             float half = Mathf.Abs(right.x) * bounds.extents.x + Mathf.Abs(right.z) * bounds.extents.z;
             if (Mathf.Abs(side) > half + lateralMargin + 0.0001f) continue;
-            float clampedSide = Mathf.Clamp(side, -half, half);
+            // Sample inside the top rather than exactly on a shared block/wall seam.
+            // Mesh raycasts and visibility rays are ambiguous on coincident edges.
+            float sampleHalf = Mathf.Max(0f, half - 0.005f);
+            float clampedSide = Mathf.Clamp(side, -sampleHalf, sampleHalf);
             Vector3 samplePoint = foot + right * (clampedSide - side);
             float halfDepth = Mathf.Abs(axis.x) * bounds.extents.x + Mathf.Abs(axis.z) * bounds.extents.z;
             float depth = Vector3.Dot(samplePoint - bounds.center, axis);

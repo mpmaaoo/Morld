@@ -2,7 +2,7 @@ using UnityEngine;
 using System.Collections.Generic;
 using Lichronicle.Gameplay.Inputs;
 
-/// <summary>Owns motion: wall routing preserves traversal, new landings acquire real 3D support.</summary>
+/// <summary>Owns motion: projected footholds hold height until a clear path permits depth alignment.</summary>
 [RequireComponent(typeof(CharacterController))]
 [DefaultExecutionOrder(1000)]
 public class PlayerController : MonoBehaviour
@@ -14,6 +14,8 @@ public class PlayerController : MonoBehaviour
     public Transform movementPlane;
     [SerializeField] private float dropThroughDownwardBoost = 3.5f;
     [SerializeField, Min(0f)] private float extraLandingEdgeForgiveness = 0.05f;
+    [Tooltip("畫面頂面的額外落地容許範圍；深度被擋住時先保留投影支撐。")]
+    [SerializeField, Min(0f)] private float projectedLandingEdgeForgiveness = 0.075f;
     private const float Step = 1f / 120f, MaxFrameTime = 0.1f, GroundTolerance = 0.025f;
     private static RaycastHit[] DepthSweepHits = new RaycastHit[32];
     private static Collider[] RouteOverlaps = new Collider[32];
@@ -30,6 +32,11 @@ public class PlayerController : MonoBehaviour
     private Vector3 _supportProjectionAxis;
     private Transform _supportTransform;
     private Vector3 _supportLocalPoint, _supportWorldPoint;
+    private FezOneWayPlatform _lastSafePlatform;
+    private Collider _lastSafeCollider;
+    private Vector3 _lastSafeLocalPlayerPosition;
+    private PlayerDebugTools _debugTools;
+    private bool _reportedLandingDiagnostic;
 
     public bool IsGrounded { get; private set; }
     public Vector3 Velocity { get; private set; }
@@ -61,6 +68,8 @@ public class PlayerController : MonoBehaviour
         if (snap != null) snap.enabled = false;
         foreach (var probe in GetComponentsInChildren<PlayerDepthProxySideProbe>(true))
             probe.enabled = false;
+        _debugTools = GetComponent<PlayerDebugTools>();
+        if (_debugTools == null) _debugTools = gameObject.AddComponent<PlayerDebugTools>();
     }
 
     private void Start() { _input = PlayerInputResolver.Resolve(gameObject); }
@@ -73,6 +82,7 @@ public class PlayerController : MonoBehaviour
         bool jump = _input != null
             ? _input.GetButtonDown("Jump") || _input.GetKeyDown(KeyCode.Space)
             : Input.GetButtonDown("Jump") || Input.GetKeyDown(KeyCode.Space);
+        if (_debugTools != null) _debugTools.RecordInput(x, down, jump);
         SimulateFrame(Time.deltaTime, x, down, jump);
     }
 
@@ -142,6 +152,7 @@ public class PlayerController : MonoBehaviour
             _jumpBuffer = _coyote = 0f;
             _jumpConsumed = true;
             IsGrounded = false;
+            _reportedLandingDiagnostic = false;
             ClearSupport();
         }
         _jumpBuffer = Mathf.Max(0f, _jumpBuffer - dt);
@@ -164,11 +175,19 @@ public class PlayerController : MonoBehaviour
             landingDelta.y = floor.point.y - feet.y;
             if (alignDepth)
                 landingDelta += DepthAxis * Vector3.Dot(floor.point - (feet + landingDelta), DepthAxis);
-            // A new landing must reach real 3D support. Validate the whole movement, rather than
-            // reporting a projected contact while the character remains outside the platform.
+            // Establish the visible foothold first. Depth alignment is a separate move
+            // and must wait when the capsule or its clearance corridor is obstructed.
             if (!alignDepth || IsRouteClear(Vector3.zero, landingDelta)) delta = landingDelta;
-            else hasPlatformFloor = false;
+            else
+            {
+                // A moving obstacle may invalidate the route after selection. Keep
+                // the same projected top instead of forcing the capsule into the wall.
+                projectedSupport = true;
+                delta.y = floor.point.y - feet.y;
+            }
         }
+        if (descending && !IsGrounded && !hasPlatformFloor)
+            TraceMissedLanding(feet, feet + delta, canMoveForeground && canAppearOnForeground);
         bool keepProjectedSupport = hasPlatformFloor && projectedSupport;
         CollisionFlags flags = _controller.Move(delta);
         bool physicalFloor = descending && (flags & CollisionFlags.Below) != 0;
@@ -187,13 +206,69 @@ public class PlayerController : MonoBehaviour
         if ((flags & CollisionFlags.Above) != 0 && _verticalSpeed > 0f) _verticalSpeed = 0f;
     }
 
+    [System.Diagnostics.Conditional("UNITY_EDITOR")]
+    private void TraceMissedLanding(Vector3 startFeet, Vector3 endFeet, bool allowVisibleLanding)
+    {
+        if (_reportedLandingDiagnostic) return;
+        Vector3 right = Vector3.Cross(Vector3.up, DepthAxis).normalized;
+        var report = new System.Text.StringBuilder();
+        foreach (var platform in FezOneWayPlatform.ActivePlatforms)
+        {
+            if (platform == null || !platform.isActiveAndEnabled) continue;
+            foreach (var body in platform.GetSolidBodyColliders())
+            {
+                if (!body.enabled || !body.gameObject.activeInHierarchy) continue;
+                Bounds bounds = body.bounds;
+                float half = Mathf.Abs(right.x) * bounds.extents.x + Mathf.Abs(right.z) * bounds.extents.z;
+                if (Mathf.Abs(Vector3.Dot(endFeet - bounds.center, right)) > half + ProjectedLandingMargin ||
+                    bounds.max.y > startFeet.y + GroundTolerance ||
+                    bounds.max.y < endFeet.y - GroundTolerance) continue;
+                bool sampled = platform.TryGetCenteredLanding(startFeet, endFeet, GroundTolerance,
+                    out var hit, DepthAxis, ProjectedLandingMargin);
+                bool visible = sampled && FezPlatformViewOcclusion.IsFootVisible(transform,
+                    hit.point, DepthAxis, platform.GetAllPlatformColliders());
+                bool pathClear = false, supportClear = false;
+                if (sampled)
+                {
+                    Vector3 landing = endFeet - startFeet;
+                    landing.y = hit.point.y - startFeet.y;
+                    landing += DepthAxis * Vector3.Dot(hit.point - (startFeet + landing), DepthAxis);
+                    pathClear = IsRouteClear(Vector3.zero, landing);
+                    supportClear = CanEstablishProjectedSupport(startFeet, endFeet, hit);
+                }
+                report.AppendLine($"body={body.name} bounds={bounds} sampled={sampled} visible={visible} pathClear={pathClear} supportClear={supportClear}");
+            }
+        }
+        if (report.Length == 0) return;
+        _reportedLandingDiagnostic = true;
+        Debug.Log($"[Morld Landing] feet={startFeet:R}->{endFeet:R} axis={DepthAxis} allowLanding={allowVisibleLanding} rotationHold={_holdDepthAfterOccludedRotation}\n{report}", this);
+    }
+
+    private bool CanEstablishProjectedSupport(Vector3 startFeet, Vector3 endFeet,
+        FezOneWayPlatform.SupportHit candidate)
+    {
+        // Forgiveness is for a new descent onto a top, not walking beyond it.
+        // Once the feet are already at that height, require the actual capsule
+        // footprint so a released ledge cannot be reacquired every simulation step.
+        if ((IsGrounded || startFeet.y <= candidate.point.y + GroundTolerance + 0.001f) &&
+            !candidate.platform.TryGetProjectedSupport(startFeet, endFeet, GroundTolerance,
+                out _, DepthAxis, SupportLateralMargin)) return false;
+        Vector3 landing = endFeet - startFeet;
+        landing.y = candidate.point.y - startFeet.y;
+        // Only acquire height here. Solid geometry at the current depth still blocks
+        // this movement, but a wall on the eventual depth path can safely wait.
+        return IsRouteClear(Vector3.zero, landing);
+    }
+
     private bool ValidateSupport(ref FezOneWayPlatform.SupportHit floor, bool projected)
     {
         Vector3 feet = _controller.bounds.center;
         feet.y = _controller.bounds.min.y;
+        float margin = IsGrounded && _support == floor.platform
+            ? SupportLateralMargin : ProjectedLandingMargin;
         return projected
-            ? floor.platform.TryGetProjectedSupport(feet, feet, GroundTolerance, out floor, DepthAxis, LandingLateralMargin)
-            : floor.platform.TryGetAnchoredFloor(feet, feet, GroundTolerance, out floor, DepthAxis, LandingLateralMargin);
+            ? floor.platform.TryGetProjectedSupport(feet, feet, GroundTolerance, out floor, DepthAxis, margin)
+            : floor.platform.TryGetAnchoredFloor(feet, feet, GroundTolerance, out floor, DepthAxis, SupportLateralMargin);
     }
 
     private bool TryResolvePlatformSupport(Vector3 startFeet, Vector3 endFeet, bool descending,
@@ -213,9 +288,9 @@ public class PlayerController : MonoBehaviour
             // is left; reacquiring its physical depth here would undo the wall route every step.
             bool retained = _supportUsesProjection
                 ? _support.TryGetProjectedSupport(startFeet, endFeet, GroundTolerance, out floor,
-                    DepthAxis, LandingLateralMargin)
+                    DepthAxis, SupportLateralMargin)
                 : _support.TryGetAnchoredFloor(startFeet, endFeet, GroundTolerance, out floor,
-                    DepthAxis, LandingLateralMargin);
+                    DepthAxis, SupportLateralMargin);
             if (retained)
             {
                 projectedSupport = _supportUsesProjection;
@@ -223,8 +298,8 @@ public class PlayerController : MonoBehaviour
                 // reacquire this same block's center without requiring a jump or a new landing.
                 if (projectedSupport && allowVisibleLanding &&
                     _support.TryGetCenteredLanding(startFeet, endFeet, GroundTolerance,
-                        out var centeredSupport, DepthAxis, LandingLateralMargin) &&
-                    CanRestoreRoutedSupport(startFeet, centeredSupport.point))
+                        out var centeredSupport, DepthAxis, SupportLateralMargin) &&
+                    CanAlignLandingDepth(startFeet, endFeet, centeredSupport))
                 {
                     floor = centeredSupport;
                     projectedSupport = false;
@@ -235,29 +310,43 @@ public class PlayerController : MonoBehaviour
         }
 
         float ignoredTop = IsDropping ? _dropTop : float.PositiveInfinity;
-        // New visible contacts acquire the block center; hidden contacts keep their physical depth.
-        if (FezOneWayPlatform.FindFloorAtCurrentDepth(startFeet, endFeet,
-                GroundTolerance, out floor, DepthAxis, LandingLateralMargin, ignoredTop))
-        {
-            if (allowVisibleLanding && floor.platform.TryGetCenteredLanding(startFeet, endFeet,
-                    GroundTolerance, out var centered, DepthAxis, LandingLateralMargin))
-            {
-                floor = centered;
-                alignDepth = Mathf.Abs(Vector3.Dot(floor.point - endFeet, DepthAxis)) > GroundTolerance;
-            }
-            return true;
-        }
+        // New visible contacts acquire height first; depth follows only with clearance.
+        bool hasPhysicalFloor = FezOneWayPlatform.FindFloorAtCurrentDepth(startFeet, endFeet,
+            GroundTolerance, out var physicalFloor, DepthAxis, SupportLateralMargin, ignoredTop);
         if (allowVisibleLanding &&
             FezOneWayPlatform.FindFloor(_controller, startFeet, endFeet, DepthAxis,
-                GroundTolerance, out floor, ignoredTop, true, LandingLateralMargin, preserveDepth: false))
+                GroundTolerance, out floor, ignoredTop, true, ProjectedLandingMargin, preserveDepth: false,
+                reachable: candidate => CanEstablishProjectedSupport(startFeet, endFeet, candidate)))
         {
             // This is a new contact, unlike retaining a foothold while walking around a wall.
             // Align only as the feet cross the top; ascent and flight never acquire a target.
-            alignDepth = Mathf.Abs(Vector3.Dot(floor.point - endFeet, DepthAxis)) > GroundTolerance;
+            bool needsDepth = Mathf.Abs(Vector3.Dot(floor.point - endFeet, DepthAxis)) > GroundTolerance;
+            bool canAlign = CanAlignLandingDepth(startFeet, endFeet, floor);
+            alignDepth = needsDepth && canAlign;
+            projectedSupport = !canAlign;
+            return true;
+        }
+
+        // Keep real support if no visible centered landing can actually be reached.
+        if (hasPhysicalFloor)
+        {
+            floor = physicalFloor;
             return true;
         }
 
         return false;
+    }
+
+    private bool CanAlignLandingDepth(Vector3 startFeet, Vector3 endFeet,
+        FezOneWayPlatform.SupportHit floor)
+    {
+        Vector3 alignedFeet = endFeet + DepthAxis * Vector3.Dot(floor.point - endFeet, DepthAxis);
+        alignedFeet.y = floor.point.y;
+        // The wider projected edge remains stable while waiting. Only convert back
+        // to physical support once the ordinary footprint can really hold the player.
+        return floor.platform.TryGetAnchoredFloor(alignedFeet, alignedFeet, GroundTolerance,
+                out _, DepthAxis, SupportLateralMargin) &&
+            CanRestoreRoutedSupport(startFeet, floor.point);
     }
 
     private bool CanRestoreRoutedSupport(Vector3 feet, Vector3 target)
@@ -275,8 +364,15 @@ public class PlayerController : MonoBehaviour
         {
             if (wall == null || !wall.isActiveAndEnabled) continue;
             foreach (var body in wall.GetBodyColliders())
-                if (body != null && body.enabled && !body.isTrigger &&
-                    body.gameObject.activeInHierarchy && corridor.Intersects(body.bounds)) return false;
+            {
+                if (body == null || !body.enabled || body.isTrigger || !body.gameObject.activeInHierarchy) continue;
+                Bounds wallClearance = body.bounds;
+                // A route over a level red top must not immediately restore the white
+                // platform's depth and put the capsule back onto that same red top.
+                wallClearance.SetMinMax(wallClearance.min, wallClearance.max +
+                    Vector3.up * (_controller.skinWidth + GroundTolerance));
+                if (corridor.Intersects(wallClearance)) return false;
+            }
         }
         foreach (var platform in FezOneWayPlatform.ActivePlatforms)
         {
@@ -301,6 +397,13 @@ public class PlayerController : MonoBehaviour
 
     private void SetSupport(FezOneWayPlatform.SupportHit hit, bool projected = false)
     {
+        if (!projected && hit.platform != null && hit.collider != null &&
+            (_lastSafePlatform != hit.platform || _lastSafeCollider != hit.collider))
+        {
+            _lastSafePlatform = hit.platform;
+            _lastSafeCollider = hit.collider;
+            _lastSafeLocalPlayerPosition = hit.collider.transform.InverseTransformPoint(transform.position);
+        }
         _support = hit.platform;
         _supportUsesProjection = projected;
         _supportProjectionAxis = DepthAxis;
@@ -310,6 +413,115 @@ public class PlayerController : MonoBehaviour
     }
 
     private void ClearSupport() { _support = null; _supportTransform = null; _supportUsesProjection = false; }
+
+    public bool TryReturnToLastSafePlatform(out string message)
+    {
+        message = "";
+        if (_controller == null || !_controller.enabled)
+        {
+            message = "玩家碰撞器尚未就緒";
+            return false;
+        }
+        if (_lastSafePlatform == null || !_lastSafePlatform.isActiveAndEnabled ||
+            _lastSafeCollider == null || !_lastSafeCollider.enabled ||
+            !_lastSafeCollider.gameObject.activeInHierarchy)
+        {
+            message = "還沒有記錄到可返回的平台";
+            return false;
+        }
+
+        Vector3 previousPosition = transform.position;
+        Quaternion previousRotation = transform.rotation;
+        Vector3 targetPosition = _lastSafeCollider.transform.TransformPoint(_lastSafeLocalPlayerPosition);
+        _controller.enabled = false;
+        transform.SetPositionAndRotation(targetPosition, previousRotation);
+        Physics.SyncTransforms();
+        _controller.enabled = true;
+        FezOneWayPlatform.InvalidatePlayerCollisionState(_controller);
+        Physics.SyncTransforms();
+
+        if (!IsRecoveryPositionClear(_lastSafePlatform, _lastSafeCollider))
+        {
+            RestorePosition(previousPosition, previousRotation);
+            message = "上一個落點目前被障礙物擋住";
+            return false;
+        }
+
+        Vector3 feet = _controller.bounds.center;
+        feet.y = _controller.bounds.min.y;
+        if (!_lastSafePlatform.TryGetAnchoredFloor(feet + Vector3.up * 0.1f,
+                feet - Vector3.up * 0.1f, 0.2f, out var floor, DepthAxis, LandingLateralMargin))
+        {
+            RestorePosition(previousPosition, previousRotation);
+            message = "上一個平台已無法支撐玩家";
+            return false;
+        }
+
+        float verticalCorrection = floor.point.y - feet.y;
+        if (Mathf.Abs(verticalCorrection) > 0.001f)
+        {
+            _controller.enabled = false;
+            transform.position += Vector3.up * verticalCorrection;
+            Physics.SyncTransforms();
+            _controller.enabled = true;
+            FezOneWayPlatform.InvalidatePlayerCollisionState(_controller);
+            Physics.SyncTransforms();
+            feet = _controller.bounds.center;
+            feet.y = _controller.bounds.min.y;
+            if (!_lastSafePlatform.TryGetAnchoredFloor(feet + Vector3.up * 0.1f,
+                    feet - Vector3.up * 0.1f, 0.2f, out floor, DepthAxis, LandingLateralMargin))
+            {
+                RestorePosition(previousPosition, previousRotation);
+                message = "返回位置未能重新確認平台支撐";
+                return false;
+            }
+        }
+
+        _verticalSpeed = _speed = _coyote = _jumpBuffer = _dropTime = 0f;
+        _jumpConsumed = false;
+        IsGrounded = true;
+        _wasRotating = false;
+        _holdDepthAfterOccludedRotation = false;
+        _lastDepthAxis = DepthAxis;
+        SetSupport(floor);
+        Velocity = Vector3.zero;
+        WalkingSpeed = 0f;
+        message = $"已返回平台：{_lastSafePlatform.name}";
+        return true;
+    }
+
+    private bool IsRecoveryPositionClear(FezOneWayPlatform allowedPlatform, Collider allowedSupport)
+    {
+        GetQueryCapsule(Vector3.zero, out var top, out var bottom, out float radius);
+        int count;
+        while (true)
+        {
+            count = Physics.OverlapCapsuleNonAlloc(top, bottom, radius, RouteOverlaps,
+                Physics.AllLayers, QueryTriggerInteraction.Ignore);
+            if (count < RouteOverlaps.Length) break;
+            if (RouteOverlaps.Length >= 4096) return false;
+            System.Array.Resize(ref RouteOverlaps, RouteOverlaps.Length * 2);
+        }
+        for (int i = 0; i < count; i++)
+        {
+            Collider other = RouteOverlaps[i];
+            if (other == allowedSupport) continue;
+            if (FezOneWayPlatform.TryResolveByCollider(other, out var owner) && owner == allowedPlatform)
+                continue;
+            if (IsRouteObstacle(other)) return false;
+        }
+        return true;
+    }
+
+    private void RestorePosition(Vector3 position, Quaternion rotation)
+    {
+        _controller.enabled = false;
+        transform.SetPositionAndRotation(position, rotation);
+        Physics.SyncTransforms();
+        _controller.enabled = true;
+        FezOneWayPlatform.InvalidatePlayerCollisionState(_controller);
+        Physics.SyncTransforms();
+    }
 
     private bool TryBeginDropThrough(FezOneWayPlatform platform)
     {
@@ -379,7 +591,7 @@ public class PlayerController : MonoBehaviour
         float targetDepth = Vector3.Dot(current.center, axis);
         float routeMinSide = float.PositiveInfinity, routeMaxSide = float.NegativeInfinity;
         bool needsRoute = false;
-        bool verticalEntry = false;
+        int routePriority = -1;
         foreach (var wall in FezBackgroundWall.ActiveWalls)
         {
             if (wall == null || !wall.isActiveAndEnabled) continue;
@@ -387,6 +599,21 @@ public class PlayerController : MonoBehaviour
             {
                 if (body == null || !body.enabled || body.isTrigger || !body.gameObject.activeInHierarchy) continue;
                 Bounds bounds = body.bounds;
+                // Keep an existing top underfoot, but route a new red wall approached
+                // sideways even when its top is level with the current white platform.
+                // Keep retrying while the center is still outside the new top; capsule
+                // overlap alone must not turn a failed first attempt into a foothold.
+                float wallHalfSide = Mathf.Abs(right.x) * bounds.extents.x + Mathf.Abs(right.z) * bounds.extents.z;
+                float wallSideOffset = Vector3.Dot(current.center - bounds.center, right);
+                bool enteringTopFromSide = Mathf.Abs(lateralMove) > 0.000001f &&
+                    wallSideOffset * lateralMove <= 0f &&
+                    Mathf.Abs(wallSideOffset) >= wallHalfSide - 0.001f &&
+                    FezBackgroundWall.OverlapsViewColumn(next, bounds, axis);
+                if (IsGrounded && current.min.y >= bounds.max.y - GroundTolerance &&
+                    next.min.y >= bounds.max.y - GroundTolerance && !enteringTopFromSide) continue;
+                // Keep the approach margin above background walls too: route before
+                // the capsule touches their top, while the depth path is still clear.
+                // Ordinary platform tops are handled separately below as floors.
                 if (next.min.y >= bounds.max.y + approachPadding ||
                     next.max.y <= bounds.min.y - approachPadding ||
                     !FezBackgroundWall.OverlapsViewColumn(next, bounds, axis)) continue;
@@ -400,13 +627,27 @@ public class PlayerController : MonoBehaviour
                 float shallow = FezBackgroundWall.ProjectBoundsShallowDepth(bounds, axis);
                 float required = shallow - radius - _controller.skinWidth - GroundTolerance;
                 if (Vector3.Dot(current.center, axis) <= required + 0.001f) continue;
+                // Body-height side obstacles define the route before lower top rims.
+                // A lower wall may extend to the room boundary without preventing
+                // a checked horizontal route around a shallower upper block.
+                bool overlapsBodyHeight = current.min.y < bounds.max.y - GroundTolerance &&
+                    current.max.y > bounds.min.y + GroundTolerance;
+                int priority = approachingSide && overlapsBodyHeight ? 2 :
+                    (approachingTop || approachingBottom ? 1 : 0);
+                if (priority < routePriority) continue;
+                if (priority > routePriority)
+                {
+                    routePriority = priority;
+                    targetDepth = Vector3.Dot(current.center, axis);
+                    routeMinSide = float.PositiveInfinity;
+                    routeMaxSide = float.NegativeInfinity;
+                }
                 targetDepth = Mathf.Min(targetDepth, required);
                 float halfSide = Mathf.Abs(right.x) * bounds.extents.x + Mathf.Abs(right.z) * bounds.extents.z;
                 float centerSide = Vector3.Dot(bounds.center, right);
                 routeMinSide = Mathf.Min(routeMinSide, centerSide - halfSide);
                 routeMaxSide = Mathf.Max(routeMaxSide, centerSide + halfSide);
                 needsRoute = true;
-                verticalEntry |= approachingTop || approachingBottom;
             }
         }
         // Blocks route only on side entry. Their top is a floor and their underside is solid.
@@ -427,6 +668,14 @@ public class PlayerController : MonoBehaviour
                 float required = FezBackgroundWall.ProjectBoundsShallowDepth(bounds, axis) -
                     radius - _controller.skinWidth - GroundTolerance;
                 if (Vector3.Dot(current.center, axis) <= required + 0.001f) continue;
+                // Solid platform sides are body-height obstacles too.
+                if (routePriority < 2)
+                {
+                    routePriority = 2;
+                    targetDepth = Vector3.Dot(current.center, axis);
+                    routeMinSide = float.PositiveInfinity;
+                    routeMaxSide = float.NegativeInfinity;
+                }
                 targetDepth = Mathf.Min(targetDepth, required);
                 float halfSide = Mathf.Abs(right.x) * bounds.extents.x + Mathf.Abs(right.z) * bounds.extents.z;
                 float centerSide = Vector3.Dot(bounds.center, right);
@@ -440,8 +689,10 @@ public class PlayerController : MonoBehaviour
         Vector3 lateral = right * lateralMove;
         if (!TryExecuteWallRoute(depthMove, lateral, right, routeMinSide, routeMaxSide, radius))
         {
-            delta -= lateral;
-            if (verticalEntry) delta.y = 0f;
+            // Routing is optional; failing to reach the foreground must not trap the
+            // player on a block or against a wall spanning the room's view column.
+            // Keep the original motion at the current depth. The enabled solid
+            // colliders still stop real contacts and allow movement away or along them.
             return;
         }
         if (IsGrounded && _support != null)
@@ -615,7 +866,31 @@ public class PlayerController : MonoBehaviour
                 System.Array.Resize(ref DepthSweepHits, DepthSweepHits.Length * 2);
             }
             for (int i = 0; i < count; i++)
-                if (IsRouteObstacle(DepthSweepHits[i].collider)) return false;
+            {
+                RaycastHit hit = DepthSweepHits[i];
+                if (!IsRouteObstacle(hit.collider)) continue;
+                // A horizontal route above a top cannot enter its solid body. Casts
+                // near a touching floor can still return initial-overlap contacts.
+                float lowestFoot = _controller.bounds.min.y +
+                    Mathf.Min(startOffset.y, startOffset.y + displacement.y);
+                if (Mathf.Abs(displacement.y) <= 0.0001f &&
+                    lowestFoot >= hit.collider.bounds.max.y - 0.001f) continue;
+                // Native skin contact can also appear as a zero-distance cast hit.
+                // Moving along or away from that face is not entering an obstacle.
+                // Endpoint penetration checks below still reject a blocked destination.
+                if (hit.distance <= 0.0001f)
+                {
+                    Vector3 normal = hit.normal;
+                    // Initial-overlap cast normals may simply oppose the cast direction.
+                    // Ask the actual shapes for the surface's separation direction instead.
+                    if (Physics.ComputePenetration(_controller, transform.position + startOffset,
+                            transform.rotation, hit.collider, hit.collider.transform.position,
+                            hit.collider.transform.rotation, out var separation, out _)) normal = separation;
+                    if (normal.sqrMagnitude > 0.5f &&
+                        Vector3.Dot(normal, displacement / distance) >= -0.0001f) continue;
+                }
+                return false;
+            }
         }
         // Sweeps do not reliably report an initial overlap; validate both endpoints too.
         return IsRoutePositionClear(startOffset) && IsRoutePositionClear(startOffset + displacement);
@@ -634,8 +909,33 @@ public class PlayerController : MonoBehaviour
             System.Array.Resize(ref RouteOverlaps, RouteOverlaps.Length * 2);
         }
         for (int i = 0; i < count; i++)
-            if (IsRouteObstacle(RouteOverlaps[i])) return false;
+        {
+            Collider other = RouteOverlaps[i];
+            if (!IsRouteObstacle(other)) continue;
+            // Overlap queries alone cannot distinguish controller skin contact from
+            // penetration. Use the actual capsule at the proposed position so standing
+            // on a floor or touching a wall does not require a jump before routing.
+            Vector3 scale = transform.lossyScale;
+            float contactTolerance = _controller.skinWidth *
+                Mathf.Max(Mathf.Abs(scale.x), Mathf.Abs(scale.y), Mathf.Abs(scale.z)) + 0.005f;
+            if (Physics.ComputePenetration(_controller, transform.position + offset, transform.rotation,
+                    other, other.transform.position, other.transform.rotation,
+                    out _, out float penetration) && penetration > contactTolerance) return false;
+        }
         return true;
+    }
+
+    private float ProjectedLandingMargin => LandingLateralMargin + projectedLandingEdgeForgiveness;
+
+    private float SupportLateralMargin
+    {
+        get
+        {
+            if (_controller == null) return 0f;
+            Vector3 scale = transform.lossyScale;
+            return Mathf.Max(0f, _controller.radius *
+                Mathf.Max(Mathf.Abs(scale.x), Mathf.Abs(scale.z)) - 0.001f);
+        }
     }
 
     private float LandingLateralMargin
