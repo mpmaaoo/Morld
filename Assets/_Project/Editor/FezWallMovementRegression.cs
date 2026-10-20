@@ -163,7 +163,7 @@ public static class FezWallMovementRegression
         cc.radius = 0.25f; cc.height = 1.6f; cc.center = Vector3.up * 0.8f; cc.skinWidth = 0.02f;
         if (_useAuthoredCapsule)
         {
-            var source = AssetDatabase.LoadAssetAtPath<GameObject>("Assets/_Project/Prefabs/Player/PlayerOld.prefab").GetComponent<CharacterController>();
+            var source = AssetDatabase.LoadAssetAtPath<GameObject>("Assets/_Project/Prefabs/Player/MorldPlayer.prefab").GetComponent<CharacterController>();
             cc.radius = source.radius; cc.height = source.height; cc.center = source.center;
             cc.skinWidth = source.skinWidth; cc.slopeLimit = source.slopeLimit;
             go.layer = source.gameObject.layer;
@@ -396,7 +396,7 @@ public static class FezWallMovementRegression
         foot.y = startingBody.bounds.max.y + 0.1f;
         var player = Player(Vector3.Dot(foot, _right), Vector3.Dot(foot, _axis), foot.y);
         var cc = player.GetComponent<CharacterController>();
-        var source = AssetDatabase.LoadAssetAtPath<GameObject>("Assets/_Project/Prefabs/Player/PlayerOld.prefab").GetComponent<PlayerController>();
+        var source = AssetDatabase.LoadAssetAtPath<GameObject>("Assets/_Project/Prefabs/Player/MorldPlayer.prefab").GetComponent<PlayerController>();
         player.moveSpeed = source.moveSpeed; player.jumpHeight = source.jumpHeight;
         player.gravity = source.gravity; player.acceleration = source.acceleration; player.deceleration = source.deceleration;
         var trace = new List<string> { "frame,yaw,input,x,y,z,grounded" };

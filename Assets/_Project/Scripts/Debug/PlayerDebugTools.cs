@@ -15,12 +15,22 @@ public sealed class PlayerDebugTools : MonoBehaviour
     [SerializeField] private KeyCode recoverKey = KeyCode.F8;
     [SerializeField, Range(4, 14)] private int visibleActionCount = 9;
     [SerializeField] private bool showOverlay = true;
+    [Header("手把顯示")]
+    [SerializeField] private bool useXboxButtonLabels = true;
+    [SerializeField, Range(0.05f, 0.5f)] private float gamepadAxisDeadzone = 0.2f;
 
     private const int MaxHistory = 120;
     private readonly Queue<InputTraceEvent> _history = new Queue<InputTraceEvent>(MaxHistory);
     private readonly HashSet<KeyCode> _knownKeys = new HashSet<KeyCode>();
     private readonly List<KeyCode> _keyboardKeys = new List<KeyCode>(160);
     private readonly List<string> _heldKeys = new List<string>(12);
+    private readonly List<string> _heldPadButtons = new List<string>(8);
+    private readonly StringBuilder _padAxes = new StringBuilder(160);
+    private readonly int[] _padAxisStates = new int[10];
+    private static readonly string[] PadButtonNames =
+        { "A", "B", "X", "Y", "LB", "RB", "Back", "Start", "LS", "RS" };
+    private string _gamepadNames = "未連接";
+    private float _nextGamepadScan;
     private PlayerController _player;
     private string _horizontalState = "";
     private string _verticalState = "";
@@ -65,8 +75,6 @@ public sealed class PlayerDebugTools : MonoBehaviour
 
         if (!hasModifier && Input.GetKeyDown(toggleOverlayKey))
             showOverlay = !showOverlay;
-        if (!hasModifier && Input.GetKeyDown(markBugKey))
-            MarkBug();
         if (!hasModifier && Input.GetKeyDown(recoverKey))
         {
             string message = "找不到玩家控制器";
@@ -84,7 +92,12 @@ public sealed class PlayerDebugTools : MonoBehaviour
         RecordAxisChange(ref _horizontalState, horizontal, "左移", "右移");
         RecordAxisChange(ref _verticalState, vertical, "下壓／下落", "前進／深度移動");
         if (jumpPressed)
-            AddEvent(vertical <= -0.5f ? "S／下方向 + 空白：嘗試下落" : "空白：跳躍");
+        {
+            string source = Input.GetKeyDown(KeyCode.Space) ? "SPACE" :
+                Input.GetKeyDown(KeyCode.JoystickButton0) ? PadButtonLabel(0) :
+                Input.GetKeyDown(KeyCode.JoystickButton1) ? PadButtonLabel(1) : "Jump";
+            AddEvent(vertical <= -0.5f ? "下方向 + " + source + "：嘗試下落" : source + "：跳躍");
+        }
 
         _heldKeys.Clear();
         for (int i = 0; i < _keyboardKeys.Count; i++)
@@ -94,6 +107,60 @@ public sealed class PlayerDebugTools : MonoBehaviour
                 _heldKeys.Add(KeyLabel(key));
             if (Input.GetKeyDown(key) && key != markBugKey && key != toggleOverlayKey && key != recoverKey)
                 AddEvent("按鍵 " + KeyLabel(key));
+        }
+        RecordGamepad();
+        // Include this frame's keyboard and gamepad state in the bug snapshot.
+        if (!hasModifier && Input.GetKeyDown(markBugKey)) MarkBug();
+    }
+
+    private string PadButtonLabel(int button)
+    {
+        return useXboxButtonLabels && button < PadButtonNames.Length
+            ? PadButtonNames[button] + " [B" + button + "]" : "B" + button;
+    }
+
+    private void RecordGamepad()
+    {
+        if (Time.unscaledTime >= _nextGamepadScan)
+        {
+            _nextGamepadScan = Time.unscaledTime + 0.5f;
+            var connected = new List<string>();
+            foreach (string pad in Input.GetJoystickNames())
+                if (!string.IsNullOrEmpty(pad)) connected.Add(pad);
+            string names = connected.Count == 0 ? "未連接" : string.Join(" / ", connected);
+            if (names != _gamepadNames)
+            {
+                _gamepadNames = names;
+                AddEvent("手把：" + names);
+            }
+        }
+
+        _heldPadButtons.Clear();
+        for (int button = 0; button < 20; button++)
+        {
+            var key = (KeyCode)((int)KeyCode.JoystickButton0 + button);
+            string label = PadButtonLabel(button);
+            if (Input.GetKey(key)) _heldPadButtons.Add(label);
+            if (Input.GetKeyDown(key)) AddEvent("手把按下 " + label);
+            if (Input.GetKeyUp(key)) AddEvent("手把放開 " + label);
+        }
+
+        _padAxes.Clear();
+        for (int axis = 0; axis < _padAxisStates.Length; axis++)
+        {
+            float raw = Input.GetAxisRaw("MorldDebugPadAxis" + (axis + 1));
+            float value = Mathf.Abs(raw) < gamepadAxisDeadzone ? 0f : raw;
+            int state = value == 0f ? 0 : Mathf.RoundToInt(value * 4f);
+            if (state != _padAxisStates[axis])
+            {
+                _padAxisStates[axis] = state;
+                AddEvent(value == 0f ? "手把軸" + (axis + 1) + " 回中" :
+                    "手把軸" + (axis + 1) + " " + value.ToString("+0.00;-0.00;0.00"));
+            }
+            if (value == 0f) continue;
+            if (_padAxes.Length > 0) _padAxes.Append("  ");
+            _padAxes.Append("軸").Append(axis + 1).Append(' ')
+                .Append(value.ToString("+0.00;-0.00;0.00"));
         }
     }
 
@@ -131,6 +198,10 @@ public sealed class PlayerDebugTools : MonoBehaviour
         report.AppendLine($"Time: {Time.unscaledTime:F2}s  Frame: {Time.frameCount}");
         report.AppendLine($"Position: {transform.position:F3}  Grounded: {_player != null && _player.IsGrounded}");
         report.AppendLine($"Support: {(_player != null && _player.StandingPlatform != null ? _player.StandingPlatform.name : "無")}");
+        report.AppendLine("Gamepad: " + _gamepadNames);
+        report.AppendLine("Held keyboard: " + string.Join(" + ", _heldKeys));
+        report.AppendLine("Held gamepad: " + string.Join(" + ", _heldPadButtons));
+        report.AppendLine("Gamepad axes: " + (_padAxes.Length == 0 ? "neutral" : _padAxes.ToString()));
         report.AppendLine("Recent input/actions:");
         foreach (InputTraceEvent entry in _history)
             report.AppendLine($"  {entry.elapsed:F2}s f{entry.frame}: {entry.action} | pos={entry.position:F2} grounded={entry.grounded} support={entry.support}");
@@ -174,12 +245,23 @@ public sealed class PlayerDebugTools : MonoBehaviour
             GetComponent<PhantomPlaybackInputSource>() != null) return;
 
         int visible = Mathf.Clamp(visibleActionCount, 4, 14);
-        float height = 108f + visible * 19f +
+        var wrap = new GUIStyle(GUI.skin.label) { wordWrap = true };
+        string keyboardText = "鍵盤：" + (_heldKeys.Count == 0 ? "（無）" : string.Join(" + ", _heldKeys));
+        string padText = "手把：" + _gamepadNames;
+        string buttonsText = "按住：" + (_heldPadButtons.Count == 0 ? "（無）" : string.Join(" + ", _heldPadButtons));
+        string axesText = "搖桿／方向／扳機：" + (_padAxes.Length == 0 ? "（回中）" : _padAxes.ToString());
+        float height = 76f + visible * 19f + wrap.CalcHeight(new GUIContent(keyboardText), 416f) +
+            wrap.CalcHeight(new GUIContent(padText), 416f) +
+            wrap.CalcHeight(new GUIContent(buttonsText), 416f) +
+            wrap.CalcHeight(new GUIContent(axesText), 416f) +
             (Time.unscaledTime < _statusUntil ? 24f : 0f);
-        GUILayout.BeginArea(new Rect(12f, 12f, 355f, height), GUI.skin.box);
+        GUILayout.BeginArea(new Rect(12f, 12f, 440f, height), GUI.skin.box);
         GUILayout.BeginVertical();
         GUILayout.Label("MORLD  |  INPUT TRACE");
-        GUILayout.Label("按住：" + (_heldKeys.Count == 0 ? "（無）" : string.Join(" + ", _heldKeys.ToArray())));
+        GUILayout.Label(keyboardText, wrap);
+        GUILayout.Label(padText, wrap);
+        GUILayout.Label(buttonsText, wrap);
+        GUILayout.Label(axesText, wrap);
         GUILayout.Label($"F6 標記 Bug  ·  F7 顯示/隱藏  ·  F8 返回上一個平台");
 
         InputTraceEvent[] entries = _history.ToArray();

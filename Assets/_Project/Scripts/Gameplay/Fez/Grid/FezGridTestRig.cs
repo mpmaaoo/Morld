@@ -4,13 +4,14 @@ using UnityEditor;
 #endif
 
 /// <summary>
+/// 【已停用的舊試作】預設不執行；定義 MORLD_LEGACY_TESTS 才可啟用。
 /// 進 Play 後跑格子投影。若這個場景的 FezMapRoot 裡有編輯器放的方塊，就用那些；
 /// 否則生成內建測試關。SampleScene 與原本的 DepthProxy 不會被改到。
 /// </summary>
 [DisallowMultipleComponent]
 public sealed class FezGridTestRig : MonoBehaviour
 {
-    private const string DefaultPlayerPrefabPath = "Assets/_Project/Prefabs/Player/GridTestPlayer.prefab";
+    private const string DefaultPlayerPrefabPath = "Assets/_Project/Legacy/Prefabs/GridTestPlayer.prefab";
 
     [SerializeField] private Transform authoredRoot;
     [SerializeField] private FezGridTestPlayer playerPrefab;
@@ -18,6 +19,7 @@ public sealed class FezGridTestRig : MonoBehaviour
 
     private void Start()
     {
+#if MORLD_LEGACY_TESTS
         EnsurePlayerPrefab();
 
         var mapObject = new GameObject("GridMap");
@@ -60,6 +62,10 @@ public sealed class FezGridTestRig : MonoBehaviour
         var light = lightObject.AddComponent<Light>();
         light.type = LightType.Directional;
         lightObject.transform.rotation = Quaternion.Euler(50f, -30f, 0f);
+#else
+        // SampleScene + PlayerController is the active implementation.
+        enabled = false;
+#endif
     }
 
     private void EnsurePlayerPrefab()

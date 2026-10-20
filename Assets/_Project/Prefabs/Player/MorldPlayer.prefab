@@ -1368,7 +1368,7 @@ GameObject:
   - component: {fileID: 4515263327091502221}
   - component: {fileID: 3745428127655239812}
   m_Layer: 11
-  m_Name: PlayerOld
+  m_Name: MorldPlayer
   m_TagString: Player
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
@@ -1518,24 +1518,12 @@ MonoBehaviour:
   jumpBufferTime: 0.1
   downInputThreshold: -0.5
   stickDeadzone: 0.25
-  dropThroughShallowCells: 1
-  dropThroughSafetyTimeout: 1.2
-  dropThroughInitialDigCells: 0.25
-  dropThroughFootProbeRadius: 0.28
-  dropThroughFootProbeDistance: 0.45
-  dropThroughDownwardBoost: 3.5
-  dropThroughEscapeSpeed: 4.5
-  dropDepthAxisSource: 0
-  dropExplicitAxisTransform: {fileID: 0}
-  dropExplicitCamera: {fileID: 0}
   acceleration: 35
   deceleration: 35
   movementPlane: {fileID: 545414944623636823}
-  collideWithFezPlatformBodies: 1
-  fezPlatformLayerName: FezPlatform
-  depthProxyLayerName: DepthProxy
-  ignoreBackgroundWallPhysics: 1
-  backgroundWallLayerName: BackGroundWall
+  dropThroughDownwardBoost: 3.5
+  extraLandingEdgeForgiveness: 0.05
+  projectedLandingEdgeForgiveness: 0.075
 --- !u!114 &3812915130685210148
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -1564,10 +1552,9 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 463090ba2fad1d044a5c0c13a15df1f9, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  targetPivot: {fileID: 545414944623636823}
+  cameraPivot: {fileID: 545414944623636823}
   stepDegrees: 90
   rotateDuration: 0.35
-  virtualCamera: {fileID: 1117157342864522469}
 --- !u!114 &1611112171436604876
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -1594,12 +1581,12 @@ MonoBehaviour:
   snapEpsilon: 0.001
   maxSnapDepthStep: 9999
   resolveShallowOnlyWhenOverlapping: 1
+  allowAutomaticOverlapShallowCorrection: 0
   overlapResolveMask:
     serializedVersion: 2
     m_Bits: 4294967295
   shallowOverlapBias: 0.05
   occlusionGate: {fileID: 0}
-  backgroundWallRouter: {fileID: 0}
 --- !u!114 &2094468743373697594
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -1628,6 +1615,7 @@ MonoBehaviour:
   occluderMask:
     serializedVersion: 2
     m_Bits: 576
+  includeAllColliderLayers: 1
   includeTriggerOccluders: 1
   raycastDistancePadding: 0.02
   occlusionSamplePoints:

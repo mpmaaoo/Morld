@@ -1,6 +1,9 @@
 using System.Collections.Generic;
 using UnityEngine;
 
+// 舊版自動深度吸附，保留以維持既有 Prefab 引用。
+// SampleScene 的 PlayerController.Awake 會停用它；目前的落地與繞行由 PlayerController 處理。
+
 [RequireComponent(typeof(CharacterController))]
 [DisallowMultipleComponent]
 [DefaultExecutionOrder(200)]

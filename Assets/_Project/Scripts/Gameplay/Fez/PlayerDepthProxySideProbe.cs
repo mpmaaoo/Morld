@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using UnityEngine;
 
 /// <summary>
+/// 【舊版相容元件】目前 PlayerController 會停用此偵測器，保留類別避免舊 Prefab 遺失腳本。
 /// 掛在玩家子物件（SideProbe）上的側向偵測器：
 /// - 只要 SideProbe 觸發到 DepthProxy，就暫時忽略玩家與該 DepthProxy 的碰撞
 /// - 離開條件後自動恢復碰撞

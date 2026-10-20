@@ -2,13 +2,15 @@ using System.Collections.Generic;
 using UnityEngine;
 
 /// <summary>
+/// 【已停用的舊試作】SampleScene 使用 MorldPlayer.prefab 上的 PlayerController。
+/// 定義 MORLD_LEGACY_TESTS 才可啟用本測試角色，類別保留以維持舊資源引用。
 /// 格子投影測試用角色。不使用 DepthProxy。
 /// 左右走、跳躍；Q／E 轉 90 度後，用新的深度軸重查腳下那一格。
 /// </summary>
 [RequireComponent(typeof(CharacterController))]
 public sealed class FezGridTestPlayer : MonoBehaviour
 {
-    [Header("移動（沿用 PlayerOld 手感）")]
+    [Header("移動（沿用 MorldPlayer 手感）")]
     [SerializeField] private float moveSpeed = 5f;
     [SerializeField] private float jumpHeight = 1.3f;
     [SerializeField] private float gravity = -25f;
@@ -90,9 +92,20 @@ public sealed class FezGridTestPlayer : MonoBehaviour
 
     private void Awake()
     {
+#if MORLD_LEGACY_TESTS
         _cc = GetComponent<CharacterController>();
         // 高度只由地板決定。轉視角後碰撞體重擺時，上台階會把人頂起來。
         _cc.stepOffset = 0f;
+#else
+        enabled = false;
+#endif
+    }
+
+    private void OnEnable()
+    {
+#if !MORLD_LEGACY_TESTS
+        enabled = false;
+#endif
     }
 
     private void LateUpdate()

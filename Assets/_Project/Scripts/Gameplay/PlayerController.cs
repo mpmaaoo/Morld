@@ -37,6 +37,10 @@ public class PlayerController : MonoBehaviour
     private Vector3 _lastSafeLocalPlayerPosition;
     private PlayerDebugTools _debugTools;
     private bool _reportedLandingDiagnostic;
+    private string _lastRouteObstruction = "none";
+    private float _nextRouteDiagnosticTime;
+    private float _nextRouteDecisionTime;
+    private string _routeDecision = "not evaluated";
 
     public bool IsGrounded { get; private set; }
     public Vector3 Velocity { get; private set; }
@@ -162,7 +166,9 @@ public class PlayerController : MonoBehaviour
         if (maxFallSpeed > 0f) _verticalSpeed = Mathf.Max(_verticalSpeed, -maxFallSpeed);
         Vector3 delta = right * ((input == 0f ? 0f : Mathf.Sign(input)) * _speed * dt) + carry;
         delta.y += (oldY + _verticalSpeed) * 0.5f * dt;
+        _routeDecision = canMoveForeground ? "collecting" : "depth movement held";
         if (canMoveForeground) RouteAroundWalls(ref delta);
+        TraceRouteDecision(input, delta);
         Vector3 feet = _controller.bounds.center;
         feet.y = _controller.bounds.min.y;
         bool descending = _verticalSpeed <= 0f;
@@ -591,6 +597,7 @@ public class PlayerController : MonoBehaviour
         float targetDepth = Vector3.Dot(current.center, axis);
         float routeMinSide = float.PositiveInfinity, routeMaxSide = float.NegativeInfinity;
         bool needsRoute = false;
+        bool routeBlocksLateralEntry = false;
         int routePriority = -1;
         foreach (var wall in FezBackgroundWall.ActiveWalls)
         {
@@ -618,15 +625,20 @@ public class PlayerController : MonoBehaviour
                     next.max.y <= bounds.min.y - approachPadding ||
                     !FezBackgroundWall.OverlapsViewColumn(next, bounds, axis)) continue;
                 bool approachingSide = Mathf.Abs(lateralMove) > 0.000001f &&
-                    Vector3.Dot(current.center - bounds.center, right) * lateralMove <= 0f;
+                    wallSideOffset * lateralMove <= 0f &&
+                    Mathf.Abs(wallSideOffset) >= wallHalfSide - 0.001f;
                 bool approachingTop = !IsGrounded && delta.y < 0f &&
                     current.min.y >= bounds.max.y - GroundTolerance;
                 bool approachingBottom = delta.y > 0f &&
                     current.max.y <= bounds.min.y + GroundTolerance;
                 if (!approachingSide && !approachingTop && !approachingBottom) continue;
+                if (!IsInCurrentRoutingRoom(body, axis)) continue;
                 float shallow = FezBackgroundWall.ProjectBoundsShallowDepth(bounds, axis);
                 float required = shallow - radius - _controller.skinWidth - GroundTolerance;
-                if (Vector3.Dot(current.center, axis) <= required + 0.001f) continue;
+                // A wall well behind the capsule is no longer an approaching obstacle.
+                // It must not outrank a new level-top wall at the player's real depth.
+                // Keep only the narrow cleared boundary band used by a recent route.
+                if (Vector3.Dot(current.center, axis) < required - GroundTolerance) continue;
                 // Body-height side obstacles define the route before lower top rims.
                 // A lower wall may extend to the room boundary without preventing
                 // a checked horizontal route around a shallower upper block.
@@ -641,7 +653,14 @@ public class PlayerController : MonoBehaviour
                     targetDepth = Vector3.Dot(current.center, axis);
                     routeMinSide = float.PositiveInfinity;
                     routeMaxSide = float.NegativeInfinity;
+                    routeBlocksLateralEntry = false;
+                    needsRoute = false;
                 }
+                // A body-height wall already cleared in depth still outranks the
+                // lower top rim. Do not replace it with a needless route past the
+                // entire supporting ledge all the way to the room boundary.
+                if (Vector3.Dot(current.center, axis) <= required + 0.001f) continue;
+                routeBlocksLateralEntry |= approachingSide && (overlapsBodyHeight || enteringTopFromSide);
                 targetDepth = Mathf.Min(targetDepth, required);
                 float halfSide = Mathf.Abs(right.x) * bounds.extents.x + Mathf.Abs(right.z) * bounds.extents.z;
                 float centerSide = Vector3.Dot(bounds.center, right);
@@ -658,6 +677,7 @@ public class PlayerController : MonoBehaviour
             {
                 if (!body.enabled || !body.gameObject.activeInHierarchy) continue;
                 Bounds bounds = body.bounds;
+                if (!IsInCurrentRoutingRoom(body, axis)) continue;
                 if (current.min.y >= bounds.max.y - GroundTolerance ||
                     current.max.y <= bounds.min.y + GroundTolerance ||
                     next.min.y >= bounds.max.y - GroundTolerance ||
@@ -667,7 +687,7 @@ public class PlayerController : MonoBehaviour
                     Vector3.Dot(current.center - bounds.center, right) * lateralMove > 0f) continue;
                 float required = FezBackgroundWall.ProjectBoundsShallowDepth(bounds, axis) -
                     radius - _controller.skinWidth - GroundTolerance;
-                if (Vector3.Dot(current.center, axis) <= required + 0.001f) continue;
+                if (Vector3.Dot(current.center, axis) < required - GroundTolerance) continue;
                 // Solid platform sides are body-height obstacles too.
                 if (routePriority < 2)
                 {
@@ -675,7 +695,11 @@ public class PlayerController : MonoBehaviour
                     targetDepth = Vector3.Dot(current.center, axis);
                     routeMinSide = float.PositiveInfinity;
                     routeMaxSide = float.NegativeInfinity;
+                    routeBlocksLateralEntry = false;
+                    needsRoute = false;
                 }
+                if (Vector3.Dot(current.center, axis) <= required + 0.001f) continue;
+                routeBlocksLateralEntry = true;
                 targetDepth = Mathf.Min(targetDepth, required);
                 float halfSide = Mathf.Abs(right.x) * bounds.extents.x + Mathf.Abs(right.z) * bounds.extents.z;
                 float centerSide = Vector3.Dot(bounds.center, right);
@@ -684,17 +708,24 @@ public class PlayerController : MonoBehaviour
                 needsRoute = true;
             }
         }
-        if (!needsRoute) return;
+        if (!needsRoute)
+        {
+            _routeDecision = "no target; priority=" + routePriority;
+            return;
+        }
         Vector3 depthMove = axis * (targetDepth - Vector3.Dot(current.center, axis));
         Vector3 lateral = right * lateralMove;
         if (!TryExecuteWallRoute(depthMove, lateral, right, routeMinSide, routeMaxSide, radius))
         {
-            // Routing is optional; failing to reach the foreground must not trap the
-            // player on a block or against a wall spanning the room's view column.
-            // Keep the original motion at the current depth. The enabled solid
-            // colliders still stop real contacts and allow movement away or along them.
+            _routeDecision = "route failed; priority=" + routePriority;
+            TraceBlockedRoute(targetDepth, lateralMove, routePriority);
+            // A blocked foreground route is a solid side in the 2D view. Prevent
+            // entry behind it, while preserving gravity, jumping and retreat.
+            // A failed top/bottom route alone must not freeze sideways movement.
+            if (routeBlocksLateralEntry) delta -= lateral;
             return;
         }
+        _routeDecision = "routed; targetDepth=" + targetDepth;
         if (IsGrounded && _support != null)
         {
             _supportUsesProjection = true;
@@ -703,12 +734,79 @@ public class PlayerController : MonoBehaviour
         else ClearSupport();
     }
 
+    [System.Diagnostics.Conditional("UNITY_EDITOR")]
+    private void TraceRouteDecision(float input, Vector3 movement)
+    {
+        if (Mathf.Abs(input) < stickDeadzone || Time.unscaledTime < _nextRouteDecisionTime) return;
+        _nextRouteDecisionTime = Time.unscaledTime + 0.2f;
+        Bounds player = _controller.bounds;
+        Vector3 axis = DepthAxis;
+        Vector3 right = Vector3.Cross(Vector3.up, axis);
+        float playerHalf = Mathf.Abs(right.x) * player.extents.x + Mathf.Abs(right.z) * player.extents.z;
+        var nearby = new System.Text.StringBuilder();
+        foreach (var wall in FezBackgroundWall.ActiveWalls)
+        {
+            if (wall == null || !wall.isActiveAndEnabled) continue;
+            foreach (var body in wall.GetBodyColliders())
+            {
+                if (body == null || !body.enabled || body.isTrigger || !body.gameObject.activeInHierarchy) continue;
+                Bounds bounds = body.bounds;
+                float half = Mathf.Abs(right.x) * bounds.extents.x + Mathf.Abs(right.z) * bounds.extents.z;
+                float side = Vector3.Dot(player.center - bounds.center, right);
+                if (Mathf.Abs(side) > half + playerHalf + 0.25f ||
+                    player.min.y > bounds.max.y + 0.2f || player.max.y < bounds.min.y - 0.2f) continue;
+                nearby.AppendLine($"wall={wall.name} bounds={bounds} side={side:R} half={half:R} " +
+                    $"feetAboveTop={player.min.y - bounds.max.y:R} room={IsInCurrentRoutingRoom(body, axis)} " +
+                    $"requiredDepth={FezBackgroundWall.ProjectBoundsShallowDepth(bounds, axis) - _controller.radius * Mathf.Max(Mathf.Abs(transform.lossyScale.x), Mathf.Abs(transform.lossyScale.z)) - _controller.skinWidth - GroundTolerance:R}");
+            }
+        }
+        Debug.Log($"[Morld Route Decision] pos={transform.position:R} input={input:R} move={movement:R} " +
+            $"axis={axis} grounded={IsGrounded} rotationHold={_holdDepthAfterOccludedRotation} " +
+            $"support={(_support != null ? _support.name : "none")} projected={_supportUsesProjection} " +
+            $"decision={_routeDecision}\n{nearby}", this);
+    }
+
+    private bool IsInCurrentRoutingRoom(Collider candidate, Vector3 axis)
+    {
+        Vector3 origin = _controller.bounds.center;
+        float depth = Vector3.Dot(candidate.bounds.center - origin, axis);
+        float distance = Mathf.Abs(depth);
+        if (distance < 0.001f) return true;
+        int count;
+        while (true)
+        {
+            count = Physics.RaycastNonAlloc(origin, axis * Mathf.Sign(depth), DepthSweepHits,
+                distance, Physics.AllLayers, QueryTriggerInteraction.Ignore);
+            if (count < DepthSweepHits.Length) break;
+            if (DepthSweepHits.Length >= 4096) return false;
+            System.Array.Resize(ref DepthSweepHits, DepthSweepHits.Length * 2);
+        }
+        foreach (var hit in new System.ArraySegment<RaycastHit>(DepthSweepHits, 0, count))
+        {
+            Collider other = hit.collider;
+            if (other == candidate || !IsRouteObstacle(other)) continue;
+            // Room planes divide projection space. Ordinary blocks remain route
+            // obstacles rather than separators, so paths around them are still checked.
+            Bounds bounds = other.bounds;
+            float thickness = Mathf.Abs(axis.x) * bounds.size.x + Mathf.Abs(axis.z) * bounds.size.z;
+            Vector3 right = Vector3.Cross(Vector3.up, axis);
+            float width = Mathf.Abs(right.x) * bounds.size.x + Mathf.Abs(right.z) * bounds.size.z;
+            bool roomPlane = other is MeshCollider && thickness < 0.01f &&
+                bounds.size.y > _controller.bounds.size.y * 2f &&
+                width > _controller.bounds.size.x * 2f;
+            if (roomPlane || other.GetComponentInParent<FezGridBoundaryWall>() != null) return false;
+        }
+        return true;
+    }
+
     private bool TryExecuteWallRoute(Vector3 depthMove, Vector3 lateral, Vector3 right,
         float minSide, float maxSide, float radius)
     {
+        _lastRouteObstruction = "none";
         Vector3 sideLeg = Vector3.zero;
         if (!IsRouteClear(Vector3.zero, depthMove) || !IsRouteClear(depthMove, lateral))
         {
+            string directFailure = _lastRouteObstruction;
             // A view change can leave the player behind the middle of a solid wall.
             // Check an actual three-leg path around either edge, including the return leg.
             ExpandConnectedWallEdges(ref minSide, ref maxSide, depthMove, right);
@@ -718,7 +816,11 @@ public class PlayerController : MonoBehaviour
             if (Mathf.Abs(second) < Mathf.Abs(first)) { float swap = first; first = second; second = swap; }
             if (CanUseSideRoute(right * first, depthMove, lateral)) sideLeg = right * first;
             else if (CanUseSideRoute(right * second, depthMove, lateral)) sideLeg = right * second;
-            else return false;
+            else
+            {
+                _lastRouteObstruction = "direct=" + directFailure + "; alternate=" + _lastRouteObstruction;
+                return false;
+            }
         }
         Vector3 before = transform.position;
         Vector3 afterSide = before, afterDepth = before;
@@ -747,7 +849,30 @@ public class PlayerController : MonoBehaviour
         Vector3 target = transform.position + displacement;
         _controller.Move(displacement);
         Physics.SyncTransforms();
-        return (transform.position - target).sqrMagnitude <= GroundTolerance * GroundTolerance;
+        bool reached = (transform.position - target).sqrMagnitude <= GroundTolerance * GroundTolerance;
+        if (!reached) _lastRouteObstruction = $"native Move: wanted={target:R} actual={transform.position:R} leg={displacement:R}";
+        return reached;
+    }
+
+    [System.Diagnostics.Conditional("UNITY_EDITOR")]
+    private void TraceBlockedRoute(float targetDepth, float lateralMove, int priority)
+    {
+        if (Time.unscaledTime < _nextRouteDiagnosticTime) return;
+        _nextRouteDiagnosticTime = Time.unscaledTime + 1f;
+        Debug.Log($"[Morld Route] pos={transform.position:R} bounds={_controller.bounds} axis={DepthAxis} " +
+            $"targetDepth={targetDepth:R} lateral={lateralMove:R} priority={priority} grounded={IsGrounded} " +
+            $"obstruction={_lastRouteObstruction}", this);
+    }
+
+    private void DescribeRouteObstruction(Collider body, Vector3 offset, Vector3 displacement, string phase)
+    {
+#if UNITY_EDITOR
+        string hierarchy = body.name;
+        for (Transform parent = body.transform.parent; parent != null; parent = parent.parent)
+            hierarchy = parent.name + "/" + hierarchy;
+        _lastRouteObstruction = $"{phase}: {hierarchy} ({body.GetType().Name}) bounds={body.bounds} " +
+            $"offset={offset:R} move={displacement:R}";
+#endif
     }
 
     private bool CanUseSideRoute(Vector3 sideLeg, Vector3 depthMove, Vector3 lateral)
@@ -784,6 +909,7 @@ public class PlayerController : MonoBehaviour
             changed = false;
             foreach (var body in GetRoutingBodies())
                 {
+                    if (!IsInCurrentRoutingRoom(body, axis)) continue;
                     Bounds bounds = body.bounds;
                     if (player.min.y >= bounds.max.y - GroundTolerance || player.max.y <= bounds.min.y + GroundTolerance ||
                         FezBackgroundWall.ProjectBoundsShallowDepth(bounds, axis) > startDepth + radius ||
@@ -889,6 +1015,7 @@ public class PlayerController : MonoBehaviour
                     if (normal.sqrMagnitude > 0.5f &&
                         Vector3.Dot(normal, displacement / distance) >= -0.0001f) continue;
                 }
+                DescribeRouteObstruction(hit.collider, startOffset, displacement, "sweep");
                 return false;
             }
         }
@@ -920,7 +1047,11 @@ public class PlayerController : MonoBehaviour
                 Mathf.Max(Mathf.Abs(scale.x), Mathf.Abs(scale.y), Mathf.Abs(scale.z)) + 0.005f;
             if (Physics.ComputePenetration(_controller, transform.position + offset, transform.rotation,
                     other, other.transform.position, other.transform.rotation,
-                    out _, out float penetration) && penetration > contactTolerance) return false;
+                    out _, out float penetration) && penetration > contactTolerance)
+            {
+                DescribeRouteObstruction(other, offset, Vector3.zero, "overlap " + penetration);
+                return false;
+            }
         }
         return true;
     }
