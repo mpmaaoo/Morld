@@ -18,6 +18,13 @@ public sealed class FezPlatformViewOcclusion : MonoBehaviour
     public static bool IsCharacterMostlyVisible(CharacterController controller, Vector3 axis,
         float requiredVisibleFraction = 0.6f)
     {
+        using (VisibilityProfile.Auto()) return IsCharacterMostlyVisibleCore(controller, axis, requiredVisibleFraction);
+    }
+
+    private static readonly Unity.Profiling.ProfilerMarker VisibilityProfile = new Unity.Profiling.ProfilerMarker("Morld.PlayerVisibility");
+    private static bool IsCharacterMostlyVisibleCore(CharacterController controller, Vector3 axis,
+        float requiredVisibleFraction)
+    {
         if (controller == null || !controller.enabled) return false;
         axis = axis.sqrMagnitude > 0.0001f ? axis.normalized : Vector3.forward;
         Bounds bounds = controller.bounds;
@@ -27,6 +34,9 @@ public sealed class FezPlatformViewOcclusion : MonoBehaviour
         const int columns = 5;
         const int rows = 6;
         int visible = 0;
+        int sampled = 0;
+        float required = Mathf.Clamp01(requiredVisibleFraction);
+        if (required <= 0f) return true;
         for (int row = 0; row < rows; row++)
         for (int column = 0; column < columns; column++)
         {
@@ -35,6 +45,10 @@ public sealed class FezPlatformViewOcclusion : MonoBehaviour
             Vector3 point = bounds.center + right * (bounds.extents.x * x)
                 + Vector3.up * (bounds.extents.y * y);
             if (!IsPointOccludedFromView(controller.transform, point, axis)) visible++;
+            sampled++;
+            // Preserve the exact 30-sample threshold, but stop once the result cannot change.
+            if (visible / (float)(columns * rows) >= required) return true;
+            if ((visible + columns * rows - sampled) / (float)(columns * rows) < required) return false;
         }
         return visible / (float)(columns * rows) >= Mathf.Clamp01(requiredVisibleFraction);
     }
@@ -262,6 +276,8 @@ public sealed class FezPlatformViewOcclusion : MonoBehaviour
     {
         if (col == null)
             return true;
+        // Enemies yield to the player and must not invalidate projected footing/routing.
+        if (col.GetComponentInParent<StationaryMeleeEnemy>() != null) return true;
 
         // A disabled visual with a live collider still participates in physics, but cannot hide a floor or silhouette.
         var visual = col.GetComponentInParent<Renderer>();

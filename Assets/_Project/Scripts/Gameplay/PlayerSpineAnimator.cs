@@ -41,6 +41,7 @@ public sealed class PlayerSpineAnimator : MonoBehaviour
     SkeletonRenderer _skeletonRenderer;
     PlayerController _player;
     CharacterController _controller;
+    PlayerMeleeAttack _melee;
     Transform _movementPlane;
     string _currentAnim = string.Empty;
     float _facingScaleX = 1f;
@@ -51,6 +52,7 @@ public sealed class PlayerSpineAnimator : MonoBehaviour
         _skeletonAnimation = GetComponent<SkeletonAnimation>();
         _skeletonRenderer = GetComponent<SkeletonRenderer>();
         _player = GetComponentInParent<PlayerController>();
+        _melee = GetComponentInParent<PlayerMeleeAttack>();
         _controller = GetComponentInParent<CharacterController>();
         if (_player != null)
             _movementPlane = _player.movementPlane;
@@ -160,7 +162,13 @@ public sealed class PlayerSpineAnimator : MonoBehaviour
 
         // 有按鍵時以輸入為準，避免加減速期間速度方向與意圖不一致
         float inputX = Input.GetAxisRaw("Horizontal");
-        if (Mathf.Abs(inputX) > _facingInputThreshold)
+        if (_player != null && _player.IsHitStunned)
+        {
+            planarSign = _player.HitFacing;
+        }
+        else if (_player != null && _player.IsDodging) planarSign = _player.DodgeFacing;
+        else if (_melee != null && _melee.IsAttacking) planarSign = _melee.AttackFacing;
+        else if (Mathf.Abs(inputX) > _facingInputThreshold)
         {
             planarSign = Mathf.Sign(inputX);
         }

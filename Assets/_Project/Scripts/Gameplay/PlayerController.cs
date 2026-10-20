@@ -16,6 +16,73 @@ public class PlayerController : MonoBehaviour
     [SerializeField, Min(0f)] private float extraLandingEdgeForgiveness = 0.05f;
     [Tooltip("畫面頂面的額外落地容許範圍；深度被擋住時先保留投影支撐。")]
     [SerializeField, Min(0f)] private float projectedLandingEdgeForgiveness = 0.075f;
+    [Header("斜面路線選擇")]
+    [Tooltip("上下輸入超過此值，且達水平輸入的一半時，優先選擇上坡或下坡；否則優先同高度。")]
+    [SerializeField, Range(0.1f, 0.9f)] private float rampDirectionThreshold = 0.35f;
+    [Tooltip("排查移動問題時才開啟詳細路徑紀錄，平常關閉以免 Console 與物理查詢拖慢測試。")]
+    [SerializeField] private bool enableMovementDiagnostics;
+    [Tooltip("空中忽略不在實際深度路徑上的平台側面；上升高度足夠時優先自然跨上頂面。關閉可對照原本的繞行行為。")]
+    [SerializeField] private bool optimizeAirbornePlatformRouting = true;
+    [Tooltip("只讓目前視角水平附近的地形參與局部移動判定；不限制深度，也不影響完整牆邊界搜尋。")]
+    [SerializeField] private bool useLocalTerrainQueries = true;
+    [SerializeField, Min(1f)] private float localTerrainRange = 3f;
+    private readonly List<FezOneWayPlatform> _nearbyPlatforms = new List<FezOneWayPlatform>();
+    private readonly List<FezBackgroundWall> _nearbyWalls = new List<FezBackgroundWall>();
+    private readonly List<FezRampBlock> _nearbyRamps = new List<FezRampBlock>();
+    private bool _usingNearbyTerrain;
+    private System.Predicate<FezOneWayPlatform.SupportHit> _physicalLandingFilter, _projectedLandingFilter;
+    private Vector3 _landingStartFeet, _landingEndFeet;
+    private IReadOnlyList<FezOneWayPlatform> LocalPlatforms => _usingNearbyTerrain ? _nearbyPlatforms : FezOneWayPlatform.ActivePlatforms;
+    private IReadOnlyList<FezBackgroundWall> LocalWalls => _usingNearbyTerrain ? _nearbyWalls : FezBackgroundWall.ActiveWalls;
+    private IReadOnlyList<FezRampBlock> LocalRamps => _usingNearbyTerrain ? _nearbyRamps : FezRampBlock.ActiveRamps;
+    private readonly List<Vector2> _connectedRouteEdges = new List<Vector2>();
+    private float _simulationTime, _failedRouteRetryAt;
+    private Vector3 _failedRoutePosition, _failedRouteAxis;
+    private float _failedRouteDepth, _failedRouteDirection, _failedRouteMin, _failedRouteMax;
+    [Header("受擊：停頓、擊退與恢復操作")]
+    [SerializeField, Min(0f)] private float hitPause = 0.045f;
+    [SerializeField, Min(0f)] private float knockbackSpeed = 7f;
+    [SerializeField, Min(0.01f)] private float knockbackDuration = 0.65f;
+    [SerializeField, Min(0f)] private float hitLaunchSpeed = 5f;
+    [SerializeField, Min(0f)] private float hitBounceSpeed = 2.4f;
+    [SerializeField, Min(0.1f)] private float hitGroundFriction = 9f;
+    [SerializeField, Min(0f)] private float hitAirDrag = 1.5f;
+    [SerializeField, Min(0.1f)] private float hitMaxLockDuration = 2f;
+    public UnityEngine.Events.UnityEvent onHitBounce = new UnityEngine.Events.UnityEvent();
+    public UnityEngine.Events.UnityEvent onHitRecovered = new UnityEngine.Events.UnityEvent();
+    private bool _hitRecovering, _hitBouncePending;
+    private float _hitSlideSpeed, _hitElapsed;
+    public bool IsHitStunned => _hitRecovering || _hitPauseRemaining > 0f;
+    // Visuals face the source while the body travels away from it.
+    public float HitFacing => -_hitDirection;
+    private float _hitPauseRemaining, _hitRemaining, _hitDirection;
+    private Vector3 _hitAxis;
+    [Header("閃避：左右短衝刺")]
+    [SerializeField] private KeyCode dodgeKey = KeyCode.LeftShift;
+    [Tooltip("自動辨識 PS／Xbox，轉接器映射異常時可手動選擇。")]
+    public GamepadLayout gamepadLayout = GamepadLayout.Auto;
+    [SerializeField, Min(0.01f)] private float dodgeDuration = 0.18f;
+    [SerializeField, Min(0f)] private float dodgeSpeed = 14f;
+    [SerializeField, Min(0f)] private float dodgeCooldown = 0.65f;
+    [SerializeField, Min(0f)] private float dodgeInvincibleDuration = 0.12f;
+    public UnityEngine.Events.UnityEvent onDodgeStarted = new UnityEngine.Events.UnityEvent();
+    public UnityEngine.Events.UnityEvent onDodgeEnded = new UnityEngine.Events.UnityEvent();
+    public bool IsDodging => _dodgeRemaining > 0f;
+    public float DodgeFacing => _dodgeDirection;
+    public float FacingDirection => IsHitStunned ? HitFacing : IsDodging ? DodgeFacing : _lastMoveFacing;
+    public bool ReadActionKeyDown(KeyCode key) => _input != null ? _input.GetKeyDown(key) : Input.GetKeyDown(key);
+    public bool IsActionLocked => IsHitStunned || IsDodging || _missRecoveryRemaining > 0f;
+    public bool IsMissRecoveryLocked => _missRecoveryRemaining > 0f;
+    private float _missRecoveryRemaining;
+    public void ApplyMissRecovery(float duration)
+    {
+        _missRecoveryRemaining = Mathf.Max(_missRecoveryRemaining, duration);
+        _speed = _jumpBuffer = 0f;
+    }
+    private float _dodgeRemaining, _dodgeElapsed, _dodgeCooldownRemaining, _dodgeDirection, _lastMoveFacing = 1f;
+    private Vector3 _dodgeAxis;
+    private bool _airDodgeUsed;
+    private Health _health;
     private const float Step = 1f / 120f, MaxFrameTime = 0.1f, GroundTolerance = 0.025f;
     private static RaycastHit[] DepthSweepHits = new RaycastHit[32];
     private static Collider[] RouteOverlaps = new Collider[32];
@@ -23,6 +90,7 @@ public class PlayerController : MonoBehaviour
     private FezRotationOcclusionGate _gate;
     private IPlayerInputSource _input;
     private float _verticalSpeed, _speed, _coyote, _jumpBuffer, _dropTime;
+    private readonly HashSet<FezOneWayPlatform> _dropPlatforms = new HashSet<FezOneWayPlatform>();
     private float _dropTop;
     private bool _jumpConsumed;
     private Vector3 _lastDepthAxis;
@@ -34,6 +102,7 @@ public class PlayerController : MonoBehaviour
     private Vector3 _supportLocalPoint, _supportWorldPoint;
     private FezOneWayPlatform _lastSafePlatform;
     private Collider _lastSafeCollider;
+    private bool _lastSafeDepthRamp;
     private Vector3 _lastSafeLocalPlayerPosition;
     private PlayerDebugTools _debugTools;
     private bool _reportedLandingDiagnostic;
@@ -44,6 +113,15 @@ public class PlayerController : MonoBehaviour
 
     public bool IsGrounded { get; private set; }
     public Vector3 Velocity { get; private set; }
+    public float FallingSpeed => IsGrounded ? 0f : Mathf.Max(0f, -_verticalSpeed);
+    public float AirbornePeakFallingSpeed { get; private set; }
+    public int LandingSequence { get; private set; }
+    public Bounds LastLandingBounds { get; private set; }
+    public Vector3 LastLandingDepthAxis { get; private set; }
+    public float LastLandingPeakFallingSpeed { get; private set; }
+    private Collider _rampWalkCollider;
+    private bool _alignRampAfterStep;
+    private FezRampBlock _depthRamp;
     public float WalkingSpeed { get; private set; }
     public FezOneWayPlatform StandingPlatform => _support;
     public static bool IsDropThroughActiveStatic { get; private set; }
@@ -54,6 +132,8 @@ public class PlayerController : MonoBehaviour
     private void Awake()
     {
         _controller = GetComponent<CharacterController>();
+        _health = GetComponent<Health>();
+        EnemyPlayerContact.RegisterPlayer(this);
         _gate = GetComponent<FezRotationOcclusionGate>();
         _lastDepthAxis = DepthAxis;
         if (movementPlane == null) movementPlane = transform;
@@ -74,9 +154,39 @@ public class PlayerController : MonoBehaviour
             probe.enabled = false;
         _debugTools = GetComponent<PlayerDebugTools>();
         if (_debugTools == null) _debugTools = gameObject.AddComponent<PlayerDebugTools>();
+        if (GetComponent<PlayerMeleeAttack>() == null) gameObject.AddComponent<PlayerMeleeAttack>();
     }
 
     private void Start() { _input = PlayerInputResolver.Resolve(gameObject); }
+
+    /// <summary>Called only after Health accepts damage. The motor owns all displacement.</summary>
+    public void ApplyHitResponse(Vector3 sourcePosition)
+    {
+        EndDodge();
+        Vector3 right = Vector3.Cross(Vector3.up, DepthAxis).normalized;
+        float side = Vector3.Dot(transform.position - sourcePosition, right);
+        _hitDirection = Mathf.Abs(side) > 0.001f ? Mathf.Sign(side) : (_hitDirection != 0f ? _hitDirection : -1f);
+        _hitAxis = DepthAxis;
+        _hitPauseRemaining = hitPause;
+        _hitRemaining = knockbackDuration;
+        _hitRecovering = true;
+        _hitBouncePending = true;
+        _hitSlideSpeed = knockbackSpeed;
+        _hitElapsed = 0f;
+        _verticalSpeed = hitLaunchSpeed;
+        _jumpConsumed = true;
+        _coyote = 0f;
+        IsGrounded = false;
+        ClearSupport();
+        _speed = _jumpBuffer = 0f;
+    }
+
+    private void ClearHitResponse()
+    {
+        _hitPauseRemaining = _hitRemaining = 0f;
+        _hitRecovering = _hitBouncePending = false;
+        _hitSlideSpeed = 0f;
+    }
 
     private void Update()
     {
@@ -84,19 +194,75 @@ public class PlayerController : MonoBehaviour
         float x = _input != null ? _input.GetAxisRaw("Horizontal") : Input.GetAxisRaw("Horizontal");
         float down = _input != null ? _input.GetAxisRaw("Vertical") : Input.GetAxisRaw("Vertical");
         bool jump = _input != null
-            ? _input.GetButtonDown("Jump") || _input.GetKeyDown(KeyCode.Space)
-            : Input.GetButtonDown("Jump") || Input.GetKeyDown(KeyCode.Space);
+            ? _input.GetButtonDown("Jump") || _input.GetKeyDown(KeyCode.Space) || _input.GetKeyDown(GamepadMapping.JumpKey(gamepadLayout))
+            : Input.GetButtonDown("Jump") || Input.GetKeyDown(KeyCode.Space) || Input.GetKeyDown(GamepadMapping.JumpKey(gamepadLayout));
         if (_debugTools != null) _debugTools.RecordInput(x, down, jump);
+        bool dodge = _input != null ? _input.GetKeyDown(dodgeKey) || _input.GetKeyDown(GamepadMapping.DodgeKey(gamepadLayout))
+            : Input.GetKeyDown(dodgeKey) || Input.GetKeyDown(GamepadMapping.DodgeKey(gamepadLayout));
+        if (dodge) TryStartDodge(x);
         SimulateFrame(Time.deltaTime, x, down, jump);
+    }
+
+    public bool TryStartDodge(float horizontal)
+    {
+        if (IsActionLocked || _dodgeCooldownRemaining > 0f || (_health != null && _health.IsDead)
+            || (_gate != null && _gate.IsRotationInProgress) || (!_controller.enabled) || (!IsGrounded && _airDodgeUsed)) return false;
+        _dodgeDirection = Mathf.Abs(horizontal) >= stickDeadzone ? Mathf.Sign(horizontal) : _lastMoveFacing;
+        _dodgeAxis = DepthAxis;
+        _dodgeRemaining = Mathf.Max(0.01f, dodgeDuration);
+        _dodgeElapsed = 0f; _dodgeCooldownRemaining = dodgeCooldown; _airDodgeUsed = true;
+        _jumpBuffer = 0f;
+        if (_health != null) _health.DodgeInvulnerable = dodgeInvincibleDuration > 0f;
+        if (_debugTools != null) _debugTools.RecordDodge();
+        onDodgeStarted.Invoke();
+        return true;
+    }
+    private void EndDodge()
+    {
+        bool wasDodging = IsDodging;
+        _dodgeRemaining = 0f;
+        if (_health != null) _health.DodgeInvulnerable = false;
+        if (wasDodging) onDodgeEnded.Invoke();
     }
 
     // Runtime and regression harness use exactly the same simulation.
     public void SimulateFrame(float frameTime, float horizontal, float vertical, bool jumpPressed)
     {
+        using (MovementProfile.Auto())
+        {
+            try { SimulateFrameCore(frameTime, horizontal, vertical, jumpPressed); }
+            finally { _usingNearbyTerrain = false; }
+        }
+    }
+
+    private static readonly Unity.Profiling.ProfilerMarker MovementProfile = new Unity.Profiling.ProfilerMarker("Morld.PlayerMovement");
+    private void SimulateFrameCore(float frameTime, float horizontal, float vertical, bool jumpPressed)
+    {
         if (_controller == null || !_controller.enabled || frameTime <= 0f) return;
+        EnemyPlayerContact.PreparePlayer(_controller);
         float dt = Mathf.Min(frameTime, MaxFrameTime);
+        _simulationTime += dt;
         bool rotating = _gate != null && _gate.IsRotationInProgress;
+        _dodgeCooldownRemaining = Mathf.Max(0f, _dodgeCooldownRemaining - dt);
+        _missRecoveryRemaining = Mathf.Max(0f, _missRecoveryRemaining - dt);
+        if (IsGrounded) _airDodgeUsed = false;
+        if (rotating || (IsDodging && Vector3.Dot(_dodgeAxis, DepthAxis) < 0.999f)) EndDodge();
+        // A new view must never reinterpret the old impulse as movement into depth.
+        if (rotating || (_hitRecovering && Vector3.Dot(_hitAxis, DepthAxis) < 0.999f)) ClearHitResponse();
+        if (_hitPauseRemaining > 0f)
+        {
+            float paused = Mathf.Min(dt, _hitPauseRemaining);
+            _hitPauseRemaining -= paused;
+            dt -= paused;
+            Velocity = Vector3.zero;
+            WalkingSpeed = 0f;
+            if (dt <= 0f) return;
+        }
+        if (IsHitStunned) { horizontal = vertical = 0f; jumpPressed = false; }
+        if (IsMissRecoveryLocked) { horizontal = vertical = 0f; jumpPressed = false; _jumpBuffer = 0f; }
+        if (IsDodging) { horizontal = _dodgeDirection; vertical = 0f; jumpPressed = false; }
         float input = Mathf.Abs(horizontal) < stickDeadzone ? 0f : Mathf.Clamp(horizontal, -1f, 1f);
+        if (!IsActionLocked && input != 0f) _lastMoveFacing = Mathf.Sign(input);
         if (rotating) { input = 0f; _speed = 0f; }
         // Preserve the original controls: acceleration changes magnitude, not direction.
         // Reversing input reverses immediately, including in the air; releasing stops displacement.
@@ -112,6 +278,7 @@ public class PlayerController : MonoBehaviour
                 _verticalSpeed = -Mathf.Max(1f, dropThroughDownwardBoost);
                 _jumpBuffer = _coyote = 0f;
                 _jumpConsumed = true;
+                AirbornePeakFallingSpeed = 0f;
                 IsGrounded = false;
                 ClearSupport();
             }
@@ -119,6 +286,7 @@ public class PlayerController : MonoBehaviour
         }
         Physics.SyncTransforms();
         bool viewChanged = Vector3.Dot(_lastDepthAxis, DepthAxis) < 0.999f;
+        if (viewChanged || rotating || IsDropping) _depthRamp = null;
         // Becoming hidden because the view changed is not a request to reach the foreground.
         // Keep both wall routing and projected landing disabled until the silhouette is clear.
         if (!rotating && (viewChanged || _wasRotating || _holdDepthAfterOccludedRotation))
@@ -132,11 +300,12 @@ public class PlayerController : MonoBehaviour
             _controller, DepthAxis, 0.5f);
         FezOneWayPlatform.PreparePlayer(_controller);
         Vector3 carry = GetSupportMotion();
+        RefreshNearbyTerrain(dt, carry);
         Vector3 start = transform.position;
         int count = Mathf.CeilToInt(dt / Step);
         float h = dt / count;
         for (int i = 0; i < count; i++)
-            SimulateStep(h, input, i == 0 ? carry : Vector3.zero,
+            SimulateStep(h, input, vertical, i == 0 ? carry : Vector3.zero,
                 canAppearOnForeground, canMoveDepth);
         Velocity = (transform.position - start) / dt;
         WalkingSpeed = input == 0f ? 0f : Mathf.Abs(Vector3.Dot(
@@ -144,9 +313,10 @@ public class PlayerController : MonoBehaviour
         IsDropThroughActiveStatic = IsDropping;
     }
 
-    private void SimulateStep(float dt, float input, Vector3 carry, bool canAppearOnForeground,
+    private void SimulateStep(float dt, float input, float verticalInput, Vector3 carry, bool canAppearOnForeground,
         bool canMoveForeground)
     {
+        bool groundedAtStepStart = IsGrounded;
         _dropTime = Mathf.Max(0f, _dropTime - dt);
         if (IsGrounded && !_jumpConsumed) _coyote = coyoteTime;
         else _coyote = Mathf.Max(0f, _coyote - dt);
@@ -161,13 +331,60 @@ public class PlayerController : MonoBehaviour
         }
         _jumpBuffer = Mathf.Max(0f, _jumpBuffer - dt);
         Vector3 right = Vector3.Cross(Vector3.up, DepthAxis).normalized;
+        float hitVelocity = 0f;
+        float control = 1f;
+        if (_hitRecovering)
+        {
+            _hitElapsed += dt;
+            float nextSpeed = Mathf.MoveTowards(_hitSlideSpeed, 0f, (IsGrounded ? hitGroundFriction : hitAirDrag) * dt);
+            hitVelocity = _hitDirection * (_hitSlideSpeed + nextSpeed) * 0.5f;
+            _hitSlideSpeed = nextSpeed;
+            control = 0f;
+            _hitRemaining = Mathf.Max(0f, _hitRemaining - dt);
+        }
         float oldY = _verticalSpeed;
         _verticalSpeed -= Mathf.Abs(gravity) * dt;
         if (maxFallSpeed > 0f) _verticalSpeed = Mathf.Max(_verticalSpeed, -maxFallSpeed);
-        Vector3 delta = right * ((input == 0f ? 0f : Mathf.Sign(input)) * _speed * dt) + carry;
+        float lateralSpeed = (input == 0f ? 0f : Mathf.Sign(input)) * _speed * control + hitVelocity;
+        if (IsDodging)
+        {
+            float activeTime = Mathf.Min(dt, _dodgeRemaining);
+            lateralSpeed = _dodgeDirection * dodgeSpeed * (activeTime / dt);
+            _dodgeElapsed += activeTime;
+            _dodgeRemaining -= activeTime;
+            if (_health != null) _health.DodgeInvulnerable = _dodgeRemaining > 0f && _dodgeElapsed < dodgeInvincibleDuration;
+            if (_dodgeRemaining <= 0f)
+            {
+                _dodgeRemaining = 0f;
+                if (_health != null) _health.DodgeInvulnerable = false;
+                onDodgeEnded.Invoke();
+            }
+        }
+        Vector3 delta = right * (lateralSpeed * dt) + carry;
         delta.y += (oldY + _verticalSpeed) * 0.5f * dt;
+        float gravityDeltaY = delta.y;
+        FezOneWayPlatform.SupportHit rampFloor = default;
+        bool rampApproach = false;
+        _alignRampAfterStep = false;
+        bool rampWalk = false;
+        if (IsGrounded && !IsDropping && _verticalSpeed <= 0f)
+        {
+            rampWalk = canMoveForeground &&
+                TryPrepareDepthRampWalk(ref delta, IsActionLocked ? 0f : verticalInput, dt,
+                    out rampFloor, out rampApproach);
+            if (!rampWalk)
+                rampWalk = TryPrepareRampWalk(ref delta, input, verticalInput,
+                    canMoveForeground && canAppearOnForeground, out rampFloor, out rampApproach);
+        }
+        _rampWalkCollider = rampWalk ? rampFloor.collider : null;
         _routeDecision = canMoveForeground ? "collecting" : "depth movement held";
+        float requestedLateral = Vector3.Dot(delta - carry, right);
         if (canMoveForeground) RouteAroundWalls(ref delta);
+        _rampWalkCollider = null;
+        if (rampWalk && Mathf.Abs(Vector3.Dot(delta - carry, right) - requestedLateral) > 0.001f)
+        { rampWalk = false; delta.y = gravityDeltaY; }
+        if (Mathf.Abs(requestedLateral) > 0.00001f && Mathf.Abs(Vector3.Dot(delta - carry, right)) < 0.00001f)
+            _hitSlideSpeed = 0f;
         TraceRouteDecision(input, delta);
         Vector3 feet = _controller.bounds.center;
         feet.y = _controller.bounds.min.y;
@@ -175,6 +392,11 @@ public class PlayerController : MonoBehaviour
         bool hasPlatformFloor = TryResolvePlatformSupport(feet + carry, feet + delta, descending,
             canMoveForeground && canAppearOnForeground,
             out var floor, out bool projectedSupport, out bool alignDepth);
+        if (rampWalk && !rampApproach)
+        {
+            hasPlatformFloor = true; floor = rampFloor; alignDepth = false;
+            projectedSupport = Mathf.Abs(Vector3.Dot(floor.point - (feet + delta), DepthAxis)) > GroundTolerance;
+        }
         if (hasPlatformFloor)
         {
             Vector3 landingDelta = delta;
@@ -195,26 +417,74 @@ public class PlayerController : MonoBehaviour
         if (descending && !IsGrounded && !hasPlatformFloor)
             TraceMissedLanding(feet, feet + delta, canMoveForeground && canAppearOnForeground);
         bool keepProjectedSupport = hasPlatformFloor && projectedSupport;
+        Bounds boundsBeforeMove = _controller.bounds;
+        Vector3 beforeMove = transform.position;
         CollisionFlags flags = _controller.Move(delta);
+        if (rampWalk && !rampApproach && _alignRampAfterStep &&
+            Mathf.Abs(_controller.bounds.min.y - rampFloor.point.y) <= GroundTolerance)
+        {
+            Vector3 depthLeg = DepthAxis * Vector3.Dot(rampFloor.point - _controller.bounds.center, DepthAxis);
+            if (IsRouteClear(Vector3.zero, depthLeg))
+            {
+                Vector3 beforeDepth = transform.position;
+                if (MoveRouteLeg(depthLeg)) keepProjectedSupport = false;
+                else MoveRouteLeg(beforeDepth - transform.position);
+            }
+        }
+        // Consume the impulse when blocked. Never accumulate pressure against a wall.
+        float wanted = Vector3.Dot(delta, right);
+        float actual = Vector3.Dot(transform.position - beforeMove, right);
+        if ((flags & CollisionFlags.Sides) != 0 && Mathf.Abs(wanted) > 0.00001f && Mathf.Abs(actual) < Mathf.Abs(wanted) * 0.25f)
+            _hitSlideSpeed = 0f;
         bool physicalFloor = descending && (flags & CollisionFlags.Below) != 0;
         bool landedOnPlatform = hasPlatformFloor &&
             Mathf.Abs(_controller.bounds.min.y - floor.point.y) <= GroundTolerance &&
             ValidateSupport(ref floor, keepProjectedSupport);
+        float stepFallingSpeed = Mathf.Max(0f, -_verticalSpeed);
         IsGrounded = physicalFloor || landedOnPlatform;
+        if (groundedAtStepStart && !IsGrounded) AirbornePeakFallingSpeed = 0f;
+        AirbornePeakFallingSpeed = Mathf.Max(AirbornePeakFallingSpeed, stepFallingSpeed);
+        if (!groundedAtStepStart && IsGrounded)
+        {
+            // Preserve the last airborne pose before landing can align platform depth.
+            LastLandingBounds = boundsBeforeMove;
+            LastLandingDepthAxis = DepthAxis;
+            LastLandingPeakFallingSpeed = AirbornePeakFallingSpeed;
+            LandingSequence++;
+        }
         if (IsGrounded)
         {
+            _dropPlatforms.Clear();
             _verticalSpeed = 0f;
             _jumpConsumed = false;
             if (landedOnPlatform) SetSupport(floor, keepProjectedSupport);
             else ClearSupport();
         }
         else ClearSupport();
+        if (_hitRecovering && IsGrounded && _hitBouncePending)
+        {
+            _hitBouncePending = false;
+            _verticalSpeed = hitBounceSpeed;
+            _hitSlideSpeed *= 0.7f;
+            _jumpConsumed = true;
+            IsGrounded = false;
+            ClearSupport();
+            onHitBounce.Invoke();
+        }
+        if (_hitRecovering && ((_hitRemaining <= 0f && IsGrounded && !_hitBouncePending && _hitSlideSpeed <= 0.2f)
+            || _hitElapsed >= hitMaxLockDuration))
+        {
+            ClearHitResponse();
+            _speed = _jumpBuffer = _coyote = 0f;
+            onHitRecovered.Invoke();
+        }
         if ((flags & CollisionFlags.Above) != 0 && _verticalSpeed > 0f) _verticalSpeed = 0f;
     }
 
     [System.Diagnostics.Conditional("UNITY_EDITOR")]
     private void TraceMissedLanding(Vector3 startFeet, Vector3 endFeet, bool allowVisibleLanding)
     {
+        if (!enableMovementDiagnostics) return;
         if (_reportedLandingDiagnostic) return;
         Vector3 right = Vector3.Cross(Vector3.up, DepthAxis).normalized;
         var report = new System.Text.StringBuilder();
@@ -266,10 +536,268 @@ public class PlayerController : MonoBehaviour
         return IsRouteClear(Vector3.zero, landing);
     }
 
+    private bool IsConnectedRampTop(Collider body, Vector3 axis)
+    {
+        if (_rampWalkCollider == null) return false;
+        Bounds ramp = _rampWalkCollider.bounds, flat = body.bounds;
+        Vector3 right = Vector3.Cross(Vector3.up, axis).normalized;
+        float rampHalf = Mathf.Abs(right.x) * ramp.extents.x + Mathf.Abs(right.z) * ramp.extents.z;
+        float flatHalf = Mathf.Abs(right.x) * flat.extents.x + Mathf.Abs(right.z) * flat.extents.z;
+        if (Mathf.Abs(Mathf.Abs(Vector3.Dot(ramp.center - flat.center, right)) - rampHalf - flatHalf) > 0.01f) return false;
+        float direction = Mathf.Sign(Vector3.Dot(flat.center - ramp.center, right));
+        Vector3 seam = ramp.center + right * (direction * rampHalf);
+        var sourceRamp = _rampWalkCollider.GetComponent<FezRampBlock>();
+        if (sourceRamp == null || !sourceRamp.TrySample(seam, axis, 0.01f, out var sourceTop, out _)) return false;
+        var nextRamp = body.GetComponent<FezRampBlock>();
+        float nextHeight = flat.max.y;
+        if (nextRamp != null)
+        {
+            if (!nextRamp.TrySample(seam, axis, 0.01f, out var nextTop, out _)) return false;
+            nextHeight = nextTop.y;
+        }
+        if (Mathf.Abs(sourceTop.y - nextHeight) > GroundTolerance) return false;
+        float rampDepth = Mathf.Abs(axis.x) * ramp.extents.x + Mathf.Abs(axis.z) * ramp.extents.z;
+        float flatDepth = Mathf.Abs(axis.x) * flat.extents.x + Mathf.Abs(axis.z) * flat.extents.z;
+        return Mathf.Abs(Vector3.Dot(ramp.center - flat.center, axis)) < rampDepth + flatDepth - 0.01f;
+    }
+
+    private bool TryPrepareDepthRampWalk(ref Vector3 delta, float verticalInput, float dt,
+        out FezOneWayPlatform.SupportHit floor, out bool approach)
+    {
+        floor = default; approach = false;
+        float input = Mathf.Abs(verticalInput) >= rampDirectionThreshold ? Mathf.Clamp(verticalInput, -1f, 1f) : 0f;
+        if (input == 0f && _depthRamp == null) return false;
+        Vector3 feet = _controller.bounds.center; feet.y = _controller.bounds.min.y;
+        float radius = _controller.radius * Mathf.Max(Mathf.Abs(transform.lossyScale.x), Mathf.Abs(transform.lossyScale.z));
+        foreach (var ramp in LocalRamps)
+        {
+            if (ramp == null || _dropPlatforms.Contains(ramp.Platform) ||
+                (input == 0f && ramp != _depthRamp) ||
+                !ramp.TryGetDepthSupport(_controller, feet, DepthAxis, out var current, out float sign) ||
+                Mathf.Abs(current.point.y - feet.y) > radius * 0.5f + GroundTolerance) continue;
+            // Enter only a real nearby slope; pressing up never teleports to its far edge.
+            Vector3 visibleContact = current.point; visibleContact.y = Mathf.Max(visibleContact.y, feet.y);
+            if (ramp != _depthRamp && !FezPlatformViewOcclusion.IsFootVisible(transform, visibleContact,
+                    DepthAxis, ramp.Platform.GetAllPlatformColliders())) continue;
+            float depthMove = sign * input * moveSpeed * dt;
+            Vector3 step = delta + DepthAxis * depthMove;
+            if (!TryGetDepthRampChainSupport(ramp, feet + step, out var target, out var targetRamp)) continue;
+            if (input > 0f)
+            {
+                float edge = sign > 0f
+                    ? FezBackgroundWall.ProjectBoundsDeepDepth(targetRamp.Body.bounds, DepthAxis)
+                    : FezBackgroundWall.ProjectBoundsShallowDepth(targetRamp.Body.bounds, DepthAxis);
+                float available = Mathf.Max(0f, sign * (edge - Vector3.Dot(feet, DepthAxis)));
+                depthMove = sign * Mathf.Min(Mathf.Abs(depthMove), available);
+            }
+            step = delta + DepthAxis * depthMove;
+            if (!TryGetDepthRampChainSupport(ramp, feet + step, out target, out targetRamp)) continue;
+            bool entering = _support != ramp.Platform && ramp != _depthRamp && target.point.y < feet.y + delta.y;
+            step.y = entering ? delta.y : target.point.y - feet.y;
+            if (!IsRouteClear(Vector3.zero, step))
+            {
+                if (ramp != _depthRamp) continue;
+                // Keep a valid foothold when the requested direction meets a wall.
+                target = current; targetRamp = ramp;
+                step = Vector3.up * (current.point.y - feet.y); entering = false;
+                if (!IsRouteClear(Vector3.zero, step)) continue;
+            }
+            _depthRamp = targetRamp; delta = step; floor = target; approach = entering;
+            return true;
+        }
+        _depthRamp = null;
+        return false;
+    }
+
+    private bool TryGetDepthRampChainSupport(FezRampBlock source, Vector3 feet,
+        out FezOneWayPlatform.SupportHit best, out FezRampBlock owner)
+    {
+        best = default; owner = null;
+        Vector3 samplingAxis = Vector3.Cross(DepthAxis, Vector3.up).normalized;
+        foreach (var candidate in LocalRamps)
+        {
+            if (candidate == null || _dropPlatforms.Contains(candidate.Platform) ||
+                !source.ContinuesSurface(candidate, samplingAxis, true) ||
+                !candidate.TryGetDepthSupport(_controller, feet, DepthAxis, out var hit, out _)) continue;
+            // The capsule rests on the union of the joined faces. Keeping the old
+            // finite edge alone would make its support curve fall below the next ramp.
+            if (owner != null && hit.point.y <= best.point.y) continue;
+            best = hit; owner = candidate;
+        }
+        return owner != null;
+    }
+
+    private bool TryPrepareRampWalk(ref Vector3 delta, float horizontalInput, float verticalInput,
+        bool allowProjected, out FezOneWayPlatform.SupportHit best,
+        out bool approach)
+    {
+        best = default;
+        approach = false;
+        Vector3 feet = _controller.bounds.center; feet.y = _controller.bounds.min.y;
+        float radius = _controller.radius * Mathf.Max(Mathf.Abs(transform.lossyScale.x), Mathf.Abs(transform.lossyScale.z));
+        Vector3 right = Vector3.Cross(Vector3.up, DepthAxis).normalized;
+        int preference = Mathf.Abs(horizontalInput) >= stickDeadzone &&
+            Mathf.Abs(verticalInput) >= Mathf.Max(rampDirectionThreshold, Mathf.Abs(horizontalInput) * 0.5f)
+            ? (verticalInput > 0f ? 1 : -1) : 0;
+        int bestRank = int.MaxValue;
+        var sourceRamp = _support != null ? _support.GetComponent<FezRampBlock>() : null;
+        float maxAdjustment = Mathf.Abs(Vector3.Dot(delta, right)) * Mathf.Tan(_controller.slopeLimit * Mathf.Deg2Rad)
+            + GroundTolerance + radius * 0.5f;
+        foreach (var ramp in LocalRamps)
+        {
+            if (ramp == null || _dropPlatforms.Contains(ramp.Platform) ||
+                !ramp.TryGetSupport(_controller, feet + delta, DepthAxis, radius, out var hit)) continue;
+            bool approaching = (_support == null || _support.GetComponent<FezRampBlock>() == null) &&
+                hit.point.y < feet.y + delta.y &&
+                ramp.TrySample(feet + delta, DepthAxis, radius, out _, out var normal) &&
+                -Vector3.Dot(normal, right) * Vector3.Dot(delta, right) > 0f;
+            if (approaching)
+                hit.point.y = feet.y + delta.y;
+            if (Mathf.Abs(hit.point.y - feet.y) > maxAdjustment) continue;
+            if (_support != hit.platform)
+            {
+                float gap = Mathf.Abs(Vector3.Dot(hit.point - feet, DepthAxis));
+                if (gap > GroundTolerance && !allowProjected) continue;
+                if (!FezPlatformViewOcclusion.IsFootVisible(transform, hit.point, DepthAxis, hit.platform.GetAllPlatformColliders())) continue;
+            }
+            Vector3 step = delta; step.y = hit.point.y - feet.y;
+            if (!IsRouteClear(Vector3.zero, step)) continue;
+            if (!approaching && _support != hit.platform)
+            {
+                Vector3 depthStep = DepthAxis * Vector3.Dot(hit.point - (feet + step), DepthAxis);
+                if (depthStep.sqrMagnitude > GroundTolerance * GroundTolerance &&
+                    !IsRouteClear(Vector3.zero, step + depthStep) &&
+                    !IsRouteClear(step, depthStep)) continue;
+            }
+            if (!ramp.TrySample(feet + delta, DepthAxis, radius, out _, out var slopeNormal)) continue;
+            float grade = -Vector3.Dot(slopeNormal, right) * Mathf.Sign(horizontalInput);
+            int direction = Mathf.Abs(grade) < 0.01f ? 0 : (grade > 0f ? 1 : -1);
+            int rank = WalkRouteRank(direction, preference);
+            if (sourceRamp != null && direction != 0 && (preference == 0 || preference == direction) &&
+                sourceRamp.ContinuesSurface(ramp, DepthAxis, false)) rank = -1;
+            if (sourceRamp != null && preference >= 0 &&
+                ramp.Body.bounds.center.y > sourceRamp.Body.bounds.center.y + GroundTolerance &&
+                hit.point.y > feet.y + 0.001f &&
+                sourceRamp.TryGetProjectedTipJoin(ramp, DepthAxis, out float tipSide, out _) &&
+                Mathf.Abs(Vector3.Dot(feet + delta, right) - tipSide) <= radius + GroundTolerance)
+                rank = -2;
+            if (!PreferWalkRoute(hit, rank, best, bestRank, feet)) continue;
+            best = hit;
+            bestRank = rank;
+            approach = approaching;
+        }
+        if (best.platform == null) return false;
+        // Compare ramps with reachable flat tops at a junction. This does not create
+        // a foothold in empty space, and never changes height without a real surface.
+        if (Mathf.Abs(horizontalInput) >= stickDeadzone)
+        {
+            foreach (var platform in LocalPlatforms)
+            {
+                if (platform == null || _dropPlatforms.Contains(platform) ||
+                    !platform.TryGetCenteredLanding(feet, feet + delta, GroundTolerance + _controller.skinWidth,
+                        out var flat, DepthAxis, 0f) ||
+                    flat.collider == null || flat.collider.GetComponent<FezRampBlock>() != null) continue;
+                if (Mathf.Abs(flat.point.y - feet.y) > GroundTolerance + _controller.skinWidth) continue;
+                float gap = Mathf.Abs(Vector3.Dot(flat.point - feet, DepthAxis));
+                if (gap > GroundTolerance && !allowProjected) continue;
+                if (platform != _support && !FezPlatformViewOcclusion.IsFootVisible(transform, flat.point,
+                        DepthAxis, platform.GetAllPlatformColliders())) continue;
+                Vector3 flatStep = delta;
+                flat.point.y += _controller.skinWidth;
+                flatStep.y = flat.point.y - feet.y;
+                flatStep += DepthAxis * Vector3.Dot(flat.point - (feet + flatStep), DepthAxis);
+                if (!IsRouteClear(Vector3.zero, flatStep)) continue;
+                int rank = WalkRouteRank(0, preference);
+                if (!PreferWalkRoute(flat, rank, best, bestRank, feet)) continue;
+                best = flat; bestRank = rank; approach = false;
+            }
+        }
+        // The capsule can approach the toe before its rounded base reaches the slope.
+        // Exempt that approach from wall routing without acquiring a projected foothold.
+        if (approach) return true;
+        delta.y = best.point.y - feet.y;
+        if (allowProjected && (_support != best.platform || _supportUsesProjection))
+        {
+            Vector3 aligned = delta + DepthAxis * Vector3.Dot(best.point - (feet + delta), DepthAxis);
+            if (IsRouteClear(Vector3.zero, aligned)) delta = aligned;
+            else if (IsRouteClear(delta, aligned - delta)) _alignRampAfterStep = true;
+        }
+        return true;
+    }
+
+    private static int WalkRouteRank(int direction, int preference)
+    {
+        if (direction == preference) return 0;
+        return preference == 0 || direction == 0 ? 1 : 2;
+    }
+
+    private bool PreferWalkRoute(FezOneWayPlatform.SupportHit candidate, int rank,
+        FezOneWayPlatform.SupportHit current, int currentRank, Vector3 feet)
+    {
+        if (current.platform == null || rank != currentRank) return current.platform == null || rank < currentRank;
+        if (rank < 0)
+        {
+            if (Mathf.Abs(candidate.point.y - current.point.y) > 0.005f)
+                return candidate.point.y > current.point.y;
+            // Mesh sampling is inset from each edge. At an otherwise level seam,
+            // hand off toward travel instead of retaining a numerically higher old edge.
+            Vector3 forward = Vector3.Cross(Vector3.up, DepthAxis).normalized * _lastMoveFacing;
+            float advance = Vector3.Dot(candidate.collider.bounds.center - current.collider.bounds.center, forward);
+            if (Mathf.Abs(advance) > 0.001f) return advance > 0f;
+        }
+        if ((candidate.platform == _support) != (current.platform == _support)) return candidate.platform == _support;
+        float candidateGap = Mathf.Abs(Vector3.Dot(candidate.point - feet, DepthAxis));
+        float currentGap = Mathf.Abs(Vector3.Dot(current.point - feet, DepthAxis));
+        if (Mathf.Abs(candidateGap - currentGap) > 0.001f) return candidateGap < currentGap;
+        return candidate.collider.GetInstanceID() < current.collider.GetInstanceID();
+    }
+
+    private bool TryResolveRampFloor(Vector3 startFeet, Vector3 endFeet, bool allowProjected,
+        out FezOneWayPlatform.SupportHit best, out bool projected, out bool align)
+    {
+        best = default; projected = false; align = false;
+        foreach (var ramp in LocalRamps)
+        {
+            float radius = _controller.radius * Mathf.Max(Mathf.Abs(transform.lossyScale.x), Mathf.Abs(transform.lossyScale.z));
+            if (ramp == null || _dropPlatforms.Contains(ramp.Platform)) continue;
+            FezOneWayPlatform.SupportHit hit;
+            bool found = ramp == _depthRamp
+                ? ramp.TryGetDepthSupport(_controller, endFeet, DepthAxis, out hit, out _)
+                : ramp.TryGetSupport(_controller, endFeet, DepthAxis, radius, out hit);
+            if (!found) continue;
+            if (hit.point.y > startFeet.y + GroundTolerance || hit.point.y < endFeet.y - GroundTolerance) continue;
+            if (IsGrounded && (_support == null || _support.GetComponent<FezRampBlock>() == null) &&
+                hit.point.y < startFeet.y - 0.001f) continue;
+            bool retained = _support == hit.platform;
+            float gap = Mathf.Abs(Vector3.Dot(hit.point - endFeet, DepthAxis));
+            if (gap > GroundTolerance && !allowProjected && !retained) continue;
+            if (!retained && !FezPlatformViewOcclusion.IsFootVisible(transform, hit.point, DepthAxis, hit.platform.GetAllPlatformColliders())) continue;
+            Vector3 landing = endFeet - startFeet; landing.y = hit.point.y - startFeet.y;
+            if (!IsRouteClear(Vector3.zero, landing)) continue;
+            if (best.platform != null && hit.point.y <= best.point.y) continue;
+            best = hit;
+            align = allowProjected && gap > GroundTolerance && CanAlignLandingDepth(startFeet, endFeet, hit);
+            projected = gap > GroundTolerance && !align;
+        }
+        return best.platform != null;
+    }
+
     private bool ValidateSupport(ref FezOneWayPlatform.SupportHit floor, bool projected)
     {
         Vector3 feet = _controller.bounds.center;
         feet.y = _controller.bounds.min.y;
+        var ramp = floor.collider != null ? floor.collider.GetComponent<FezRampBlock>() : null;
+        if (ramp != null)
+        {
+            float radius = _controller.radius * Mathf.Max(Mathf.Abs(transform.lossyScale.x), Mathf.Abs(transform.lossyScale.z));
+            FezOneWayPlatform.SupportHit support;
+            bool found = ramp == _depthRamp
+                ? ramp.TryGetDepthSupport(_controller, feet, DepthAxis, out support, out _)
+                : ramp.TryGetSupport(_controller, feet, DepthAxis, radius, out support);
+            if (!found || Mathf.Abs(support.point.y - feet.y) > GroundTolerance + _controller.skinWidth) return false;
+            floor = support;
+            return true;
+        }
         float margin = IsGrounded && _support == floor.platform
             ? SupportLateralMargin : ProjectedLandingMargin;
         return projected
@@ -285,6 +813,8 @@ public class PlayerController : MonoBehaviour
         projectedSupport = false;
         alignDepth = false;
         if (!descending) return false;
+        if (!IsDropping && TryResolveRampFloor(startFeet, endFeet, allowVisibleLanding,
+                out floor, out projectedSupport, out alignDepth)) return true;
 
         // Remaining on a valid foothold is not a new landing. Preserve its actual world point
         // even when the camera changes or another platform becomes visible in front of it.
@@ -317,12 +847,18 @@ public class PlayerController : MonoBehaviour
 
         float ignoredTop = IsDropping ? _dropTop : float.PositiveInfinity;
         // New visible contacts acquire height first; depth follows only with clearance.
+        _landingStartFeet = startFeet;
+        _landingEndFeet = endFeet;
+        if (_physicalLandingFilter == null) _physicalLandingFilter = AcceptPhysicalLanding;
+        if (_projectedLandingFilter == null) _projectedLandingFilter = AcceptProjectedLanding;
         bool hasPhysicalFloor = FezOneWayPlatform.FindFloorAtCurrentDepth(startFeet, endFeet,
-            GroundTolerance, out var physicalFloor, DepthAxis, SupportLateralMargin, ignoredTop);
+            GroundTolerance, out var physicalFloor, DepthAxis, SupportLateralMargin, ignoredTop,
+            _physicalLandingFilter, _usingNearbyTerrain ? _nearbyPlatforms : null);
         if (allowVisibleLanding &&
             FezOneWayPlatform.FindFloor(_controller, startFeet, endFeet, DepthAxis,
                 GroundTolerance, out floor, ignoredTop, true, ProjectedLandingMargin, preserveDepth: false,
-                reachable: candidate => CanEstablishProjectedSupport(startFeet, endFeet, candidate)))
+                reachable: _projectedLandingFilter,
+                fallbackPlatforms: _usingNearbyTerrain ? _nearbyPlatforms : null))
         {
             // This is a new contact, unlike retaining a foothold while walking around a wall.
             // Align only as the feet cross the top; ascent and flight never acquire a target.
@@ -343,11 +879,21 @@ public class PlayerController : MonoBehaviour
         return false;
     }
 
+    private bool AcceptPhysicalLanding(FezOneWayPlatform.SupportHit candidate) =>
+        !_dropPlatforms.Contains(candidate.platform);
+
+    private bool AcceptProjectedLanding(FezOneWayPlatform.SupportHit candidate) =>
+        AcceptPhysicalLanding(candidate) &&
+        (candidate.collider == null || candidate.collider.GetComponent<FezRampBlock>() == null) &&
+        CanEstablishProjectedSupport(_landingStartFeet, _landingEndFeet, candidate);
+
     private bool CanAlignLandingDepth(Vector3 startFeet, Vector3 endFeet,
         FezOneWayPlatform.SupportHit floor)
     {
         Vector3 alignedFeet = endFeet + DepthAxis * Vector3.Dot(floor.point - endFeet, DepthAxis);
         alignedFeet.y = floor.point.y;
+        if (floor.collider != null && floor.collider.GetComponent<FezRampBlock>() != null)
+            return IsRouteClear(Vector3.zero, alignedFeet - startFeet);
         // The wider projected edge remains stable while waiting. Only convert back
         // to physical support once the ordinary footprint can really hold the player.
         return floor.platform.TryGetAnchoredFloor(alignedFeet, alignedFeet, GroundTolerance,
@@ -366,7 +912,7 @@ public class PlayerController : MonoBehaviour
         Vector3 right = Vector3.Cross(Vector3.up, DepthAxis);
         corridor.Expand(new Vector3(Mathf.Abs(right.x), 0f, Mathf.Abs(right.z)) *
             (2f * (_controller.skinWidth + GroundTolerance + 0.05f)));
-        foreach (var wall in FezBackgroundWall.ActiveWalls)
+        foreach (var wall in LocalWalls)
         {
             if (wall == null || !wall.isActiveAndEnabled) continue;
             foreach (var body in wall.GetBodyColliders())
@@ -380,7 +926,7 @@ public class PlayerController : MonoBehaviour
                 if (corridor.Intersects(wallClearance)) return false;
             }
         }
-        foreach (var platform in FezOneWayPlatform.ActivePlatforms)
+        foreach (var platform in LocalPlatforms)
         {
             if (platform == null || !platform.isActiveAndEnabled) continue;
             foreach (var body in platform.GetSolidBodyColliders())
@@ -390,6 +936,45 @@ public class PlayerController : MonoBehaviour
                     corridor.Intersects(body.bounds)) return false;
         }
         return IsRouteClear(Vector3.zero, shift);
+    }
+
+    private void RefreshNearbyTerrain(float dt, Vector3 carry)
+    {
+        _usingNearbyTerrain = false;
+        if (!useLocalTerrainQueries) return;
+        _nearbyPlatforms.Clear();
+        _nearbyWalls.Clear();
+        _nearbyRamps.Clear();
+        Vector3 axis = DepthAxis;
+        Vector3 right = Vector3.Cross(Vector3.up, axis).normalized;
+        Bounds query = _controller.bounds;
+        query.Encapsulate(_controller.bounds.min + carry);
+        query.Encapsulate(_controller.bounds.max + carry);
+        float speed = Mathf.Max(Mathf.Max(Mathf.Abs(moveSpeed), Mathf.Abs(_speed)),
+            Mathf.Max(dodgeSpeed, Mathf.Abs(_hitSlideSpeed)));
+        float margin = Mathf.Max(localTerrainRange, speed * dt + _controller.skinWidth +
+            GroundTolerance + projectedLandingEdgeForgiveness + extraLandingEdgeForgiveness);
+        query.Expand(new Vector3(Mathf.Abs(right.x), 0f, Mathf.Abs(right.z)) * (2f * margin));
+        // Only reject along screen horizontal: depth and height remain unrestricted.
+        foreach (var platform in FezOneWayPlatform.ActivePlatforms)
+            if (platform != null && platform.isActiveAndEnabled && platform.OverlapsViewColumn(query, axis))
+                _nearbyPlatforms.Add(platform);
+        foreach (var wall in FezBackgroundWall.ActiveWalls)
+        {
+            if (wall == null || !wall.isActiveAndEnabled) continue;
+            foreach (var body in wall.GetBodyColliders())
+                if (body != null && body.enabled && !body.isTrigger && body.gameObject.activeInHierarchy &&
+                    FezBackgroundWall.OverlapsViewColumn(query, body.bounds, axis))
+                {
+                    _nearbyWalls.Add(wall);
+                    break;
+                }
+        }
+        foreach (var ramp in FezRampBlock.ActiveRamps)
+            if (ramp != null && ramp.isActiveAndEnabled && ramp.Body != null && ramp.Body.enabled &&
+                FezBackgroundWall.OverlapsViewColumn(query, ramp.Body.bounds, axis))
+                _nearbyRamps.Add(ramp);
+        _usingNearbyTerrain = true;
     }
 
     private Vector3 GetSupportMotion()
@@ -408,6 +993,7 @@ public class PlayerController : MonoBehaviour
         {
             _lastSafePlatform = hit.platform;
             _lastSafeCollider = hit.collider;
+            _lastSafeDepthRamp = _depthRamp != null && hit.collider == _depthRamp.Body;
             _lastSafeLocalPlayerPosition = hit.collider.transform.InverseTransformPoint(transform.position);
         }
         _support = hit.platform;
@@ -455,8 +1041,7 @@ public class PlayerController : MonoBehaviour
 
         Vector3 feet = _controller.bounds.center;
         feet.y = _controller.bounds.min.y;
-        if (!_lastSafePlatform.TryGetAnchoredFloor(feet + Vector3.up * 0.1f,
-                feet - Vector3.up * 0.1f, 0.2f, out var floor, DepthAxis, LandingLateralMargin))
+        if (!TryGetRecoverySupport(feet, out var floor))
         {
             RestorePosition(previousPosition, previousRotation);
             message = "上一個平台已無法支撐玩家";
@@ -474,8 +1059,7 @@ public class PlayerController : MonoBehaviour
             Physics.SyncTransforms();
             feet = _controller.bounds.center;
             feet.y = _controller.bounds.min.y;
-            if (!_lastSafePlatform.TryGetAnchoredFloor(feet + Vector3.up * 0.1f,
-                    feet - Vector3.up * 0.1f, 0.2f, out floor, DepthAxis, LandingLateralMargin))
+            if (!TryGetRecoverySupport(feet, out floor))
             {
                 RestorePosition(previousPosition, previousRotation);
                 message = "返回位置未能重新確認平台支撐";
@@ -483,17 +1067,33 @@ public class PlayerController : MonoBehaviour
             }
         }
 
+        EndDodge();
+        ClearHitResponse();
+        _missRecoveryRemaining = 0f;
         _verticalSpeed = _speed = _coyote = _jumpBuffer = _dropTime = 0f;
+        _dropPlatforms.Clear();
         _jumpConsumed = false;
         IsGrounded = true;
         _wasRotating = false;
         _holdDepthAfterOccludedRotation = false;
         _lastDepthAxis = DepthAxis;
+        _depthRamp = _lastSafeDepthRamp ? _lastSafeCollider.GetComponent<FezRampBlock>() : null;
         SetSupport(floor);
         Velocity = Vector3.zero;
         WalkingSpeed = 0f;
         message = $"已返回平台：{_lastSafePlatform.name}";
         return true;
+    }
+
+    private bool TryGetRecoverySupport(Vector3 feet, out FezOneWayPlatform.SupportHit floor)
+    {
+        var ramp = _lastSafeCollider.GetComponent<FezRampBlock>();
+        if (ramp != null && _lastSafeDepthRamp &&
+            ramp.TryGetDepthSupport(_controller, feet, DepthAxis, out floor, out _)) return true;
+        return ramp != null
+            ? ramp.TryGetSupport(_controller, feet, DepthAxis, LandingLateralMargin, out floor)
+            : _lastSafePlatform.TryGetAnchoredFloor(feet + Vector3.up * 0.1f,
+                feet - Vector3.up * 0.1f, 0.2f, out floor, DepthAxis, LandingLateralMargin);
     }
 
     private bool IsRecoveryPositionClear(FezOneWayPlatform allowedPlatform, Collider allowedSupport)
@@ -531,6 +1131,7 @@ public class PlayerController : MonoBehaviour
 
     private bool TryBeginDropThrough(FezOneWayPlatform platform)
     {
+        var droppedPlatforms = new HashSet<FezOneWayPlatform> { platform };
         Vector3 axis = DepthAxis;
         Bounds player = _controller.bounds;
         float radius = Mathf.Abs(axis.x) * player.extents.x + Mathf.Abs(axis.z) * player.extents.z;
@@ -550,7 +1151,7 @@ public class PlayerController : MonoBehaviour
         do
         {
             extended = false;
-            foreach (var other in FezOneWayPlatform.ActivePlatforms)
+            foreach (var other in LocalPlatforms)
             {
                 if (other == null || !other.isActiveAndEnabled) continue;
                 foreach (var body in other.GetSolidBodyColliders())
@@ -562,6 +1163,7 @@ public class PlayerController : MonoBehaviour
                         !FezBackgroundWall.OverlapsViewColumn(player, bounds, axis) ||
                         FezBackgroundWall.ProjectBoundsDeepDepth(bounds, axis) < targetDepth - radius ||
                         FezBackgroundWall.ProjectBoundsShallowDepth(bounds, axis) > currentDepth + radius) continue;
+                    droppedPlatforms.Add(other);
                     float required = FezBackgroundWall.ProjectBoundsShallowDepth(bounds, axis) -
                         radius - _controller.skinWidth - GroundTolerance;
                     if (required >= targetDepth - 0.001f) continue;
@@ -574,7 +1176,11 @@ public class PlayerController : MonoBehaviour
         // Drop follows a checked path around the front edge, never an ignored collision pair.
         if (!IsRouteClear(Vector3.zero, displacement)) return false;
         Vector3 before = transform.position;
-        if (MoveRouteLeg(displacement)) return true;
+        if (MoveRouteLeg(displacement))
+        {
+            _dropPlatforms.UnionWith(droppedPlatforms);
+            return true;
+        }
         MoveRouteLeg(before - transform.position);
         return false;
     }
@@ -599,7 +1205,7 @@ public class PlayerController : MonoBehaviour
         bool needsRoute = false;
         bool routeBlocksLateralEntry = false;
         int routePriority = -1;
-        foreach (var wall in FezBackgroundWall.ActiveWalls)
+        foreach (var wall in LocalWalls)
         {
             if (wall == null || !wall.isActiveAndEnabled) continue;
             foreach (var body in wall.GetBodyColliders())
@@ -670,21 +1276,45 @@ public class PlayerController : MonoBehaviour
             }
         }
         // Blocks route only on side entry. Their top is a floor and their underside is solid.
-        foreach (var platform in FezOneWayPlatform.ActivePlatforms)
+        var walkingRamp = _rampWalkCollider != null ? _rampWalkCollider.GetComponent<FezRampBlock>() : null;
+        foreach (var platform in LocalPlatforms)
         {
             if (platform == null || !platform.isActiveAndEnabled) continue;
             foreach (var body in platform.GetSolidBodyColliders())
             {
                 if (!body.enabled || !body.gameObject.activeInHierarchy) continue;
+                if (body == _rampWalkCollider) continue;
                 Bounds bounds = body.bounds;
-                if (!IsInCurrentRoutingRoom(body, axis)) continue;
+                // Reject irrelevant blocks before any mesh sampling or ramp-connection checks.
                 if (current.min.y >= bounds.max.y - GroundTolerance ||
                     current.max.y <= bounds.min.y + GroundTolerance ||
                     next.min.y >= bounds.max.y - GroundTolerance ||
                     next.max.y <= bounds.min.y + GroundTolerance ||
                     !FezBackgroundWall.OverlapsViewColumn(next, bounds, axis)) continue;
+                if (optimizeAirbornePlatformRouting && !IsGrounded &&
+                    !ShouldRouteAirbornePlatform(current, next, bounds, axis)) continue;
+                // A real adjoining plateau is reached along the slope, not by routing
+                // around its vertical side. The capsule sweep still checks solidity.
+                if (IsConnectedRampTop(body, axis)) continue;
+                var ramp = body.GetComponent<FezRampBlock>();
+                // The chosen ramp step already passed real capsule clearance checks.
+                // Other faces meeting that junction must not replace it with an AABB
+                // route outside the room (including an opposing face below the target).
+                if (ramp != null && walkingRamp != null &&
+                    FezBackgroundWall.OverlapsViewColumn(next, body.bounds, axis) &&
+                    (walkingRamp.ContinuesSurface(ramp, axis, false) ||
+                     walkingRamp.TryGetProjectedTipJoin(ramp, axis, out _, out _)))
+                    continue;
+                float footRadius = _controller.radius * Mathf.Max(Mathf.Abs(transform.lossyScale.x), Mathf.Abs(transform.lossyScale.z));
+                if (ramp != null && ramp.TrySample(next.center, axis, footRadius + approachPadding,
+                        out var toe, out _) && toe.y <= current.min.y + GroundTolerance) continue;
+                if (ramp != null && ramp.TryGetSupport(_controller,
+                        new Vector3(next.center.x, next.min.y, next.center.z), axis, 0f, out var slopeTop) &&
+                    (next.min.y >= slopeTop.point.y - GroundTolerance ||
+                     (delta.y < 0f && current.min.y >= slopeTop.point.y - GroundTolerance))) continue;
                 if (Mathf.Abs(lateralMove) <= 0.000001f ||
                     Vector3.Dot(current.center - bounds.center, right) * lateralMove > 0f) continue;
+                if (!IsInCurrentRoutingRoom(body, axis)) continue;
                 float required = FezBackgroundWall.ProjectBoundsShallowDepth(bounds, axis) -
                     radius - _controller.skinWidth - GroundTolerance;
                 if (Vector3.Dot(current.center, axis) < required - GroundTolerance) continue;
@@ -737,6 +1367,7 @@ public class PlayerController : MonoBehaviour
     [System.Diagnostics.Conditional("UNITY_EDITOR")]
     private void TraceRouteDecision(float input, Vector3 movement)
     {
+        if (!enableMovementDiagnostics) return;
         if (Mathf.Abs(input) < stickDeadzone || Time.unscaledTime < _nextRouteDecisionTime) return;
         _nextRouteDecisionTime = Time.unscaledTime + 0.2f;
         Bounds player = _controller.bounds;
@@ -799,6 +1430,23 @@ public class PlayerController : MonoBehaviour
         return true;
     }
 
+    private bool ShouldRouteAirbornePlatform(Bounds current, Bounds next, Bounds block, Vector3 axis)
+    {
+        float halfDepth = Mathf.Abs(axis.x) * block.extents.x + Mathf.Abs(axis.z) * block.extents.z;
+        float playerRadius = Mathf.Abs(axis.x) * current.extents.x + Mathf.Abs(axis.z) * current.extents.z;
+        float blockDepth = Vector3.Dot(block.center, axis);
+        float startDepth = Vector3.Dot(current.center, axis);
+        float endDepth = Vector3.Dot(next.center, axis);
+        if (Mathf.Max(startDepth, endDepth) + playerRadius < blockDepth - halfDepth ||
+            Mathf.Min(startDepth, endDepth) - playerRadius > blockDepth + halfDepth) return false;
+        if (_verticalSpeed > 0f)
+        {
+            float remainingRise = _verticalSpeed * _verticalSpeed / (2f * Mathf.Max(0.001f, Mathf.Abs(gravity)));
+            if (current.min.y + remainingRise >= block.max.y + GroundTolerance) return false;
+        }
+        return true;
+    }
+
     private bool TryExecuteWallRoute(Vector3 depthMove, Vector3 lateral, Vector3 right,
         float minSide, float maxSide, float radius)
     {
@@ -806,6 +1454,15 @@ public class PlayerController : MonoBehaviour
         Vector3 sideLeg = Vector3.zero;
         if (!IsRouteClear(Vector3.zero, depthMove) || !IsRouteClear(depthMove, lateral))
         {
+            float targetDepth = Vector3.Dot(_controller.bounds.center + depthMove, DepthAxis);
+            float direction = Mathf.Sign(Vector3.Dot(lateral, right));
+            float initialMin = minSide, initialMax = maxSide;
+            if (_simulationTime < _failedRouteRetryAt &&
+                (transform.position - _failedRoutePosition).sqrMagnitude < 0.0001f &&
+                Vector3.Dot(DepthAxis, _failedRouteAxis) > 0.999f &&
+                Mathf.Abs(targetDepth - _failedRouteDepth) < 0.001f && direction == _failedRouteDirection &&
+                Mathf.Abs(minSide - _failedRouteMin) < 0.001f && Mathf.Abs(maxSide - _failedRouteMax) < 0.001f)
+                return false;
             string directFailure = _lastRouteObstruction;
             // A view change can leave the player behind the middle of a solid wall.
             // Check an actual three-leg path around either edge, including the return leg.
@@ -818,6 +1475,12 @@ public class PlayerController : MonoBehaviour
             else if (CanUseSideRoute(right * second, depthMove, lateral)) sideLeg = right * second;
             else
             {
+                // Recheck direct clearance every step, but throttle the expensive
+                // identical edge search while stationary. Moving/reversing retries now.
+                _failedRouteRetryAt = _simulationTime + 0.1f;
+                _failedRoutePosition = transform.position; _failedRouteAxis = DepthAxis;
+                _failedRouteDepth = targetDepth; _failedRouteDirection = direction;
+                _failedRouteMin = initialMin; _failedRouteMax = initialMax;
                 _lastRouteObstruction = "direct=" + directFailure + "; alternate=" + _lastRouteObstruction;
                 return false;
             }
@@ -857,6 +1520,7 @@ public class PlayerController : MonoBehaviour
     [System.Diagnostics.Conditional("UNITY_EDITOR")]
     private void TraceBlockedRoute(float targetDepth, float lateralMove, int priority)
     {
+        if (!enableMovementDiagnostics) return;
         if (Time.unscaledTime < _nextRouteDiagnosticTime) return;
         _nextRouteDiagnosticTime = Time.unscaledTime + 1f;
         Debug.Log($"[Morld Route] pos={transform.position:R} bounds={_controller.bounds} axis={DepthAxis} " +
@@ -867,6 +1531,7 @@ public class PlayerController : MonoBehaviour
     private void DescribeRouteObstruction(Collider body, Vector3 offset, Vector3 displacement, string phase)
     {
 #if UNITY_EDITOR
+        if (!enableMovementDiagnostics) return;
         string hierarchy = body.name;
         for (Transform parent = body.transform.parent; parent != null; parent = parent.parent)
             hierarchy = parent.name + "/" + hierarchy;
@@ -903,25 +1568,30 @@ public class PlayerController : MonoBehaviour
         float startDepth = Vector3.Dot(player.center, axis);
         float radius = Mathf.Abs(axis.x) * player.extents.x + Mathf.Abs(axis.z) * player.extents.z;
         float endDepth = startDepth + Vector3.Dot(depthMove, axis);
-        bool changed;
-        do
-        {
-            changed = false;
+        _connectedRouteEdges.Clear();
             foreach (var body in GetRoutingBodies())
                 {
-                    if (!IsInCurrentRoutingRoom(body, axis)) continue;
                     Bounds bounds = body.bounds;
                     if (player.min.y >= bounds.max.y - GroundTolerance || player.max.y <= bounds.min.y + GroundTolerance ||
                         FezBackgroundWall.ProjectBoundsShallowDepth(bounds, axis) > startDepth + radius ||
                         FezBackgroundWall.ProjectBoundsDeepDepth(bounds, axis) < endDepth - radius) continue;
+                    if (!IsInCurrentRoutingRoom(body, axis)) continue;
                     float center = Vector3.Dot(bounds.center, right);
                     float half = Mathf.Abs(right.x) * bounds.extents.x + Mathf.Abs(right.z) * bounds.extents.z;
                     float left = center - half, rightEdge = center + half;
-                    if (left > maxSide + GroundTolerance || rightEdge < minSide - GroundTolerance) continue;
-                    if (left < minSide - 0.001f) { minSide = left; changed = true; }
-                    if (rightEdge > maxSide + 0.001f) { maxSide = rightEdge; changed = true; }
+                    _connectedRouteEdges.Add(new Vector2(left, rightEdge));
                 }
-        } while (changed);
+        _connectedRouteEdges.Sort((a, b) => a.x.CompareTo(b.x));
+        float low = float.PositiveInfinity, high = float.NegativeInfinity;
+        for (int i = 0; i <= _connectedRouteEdges.Count; i++)
+        {
+            if (i < _connectedRouteEdges.Count && _connectedRouteEdges[i].x <= high + GroundTolerance)
+            { high = Mathf.Max(high, _connectedRouteEdges[i].y); continue; }
+            if (low <= maxSide + GroundTolerance && high >= minSide - GroundTolerance)
+            { minSide = Mathf.Min(minSide, low); maxSide = Mathf.Max(maxSide, high); }
+            if (i < _connectedRouteEdges.Count)
+            { low = _connectedRouteEdges[i].x; high = _connectedRouteEdges[i].y; }
+        }
     }
 
     private bool IsFullyClearAfterRotation()
@@ -964,6 +1634,7 @@ public class PlayerController : MonoBehaviour
     private bool IsRouteObstacle(Collider other)
     {
         if (other == null || other == _controller || other.transform.IsChildOf(transform)) return false;
+        if (other.GetComponentInParent<StationaryMeleeEnemy>() != null) return false;
         // Depth proxies are query geometry. Real platform bodies still occupy route space.
         if (other.GetComponentInParent<FezDepthProxyFollower>() != null) return false;
         if (other.GetComponentInParent<FezBackgroundWall>() != null) return true;
@@ -1082,11 +1753,18 @@ public class PlayerController : MonoBehaviour
 
     private void OnDisable()
     {
+        EndDodge();
+        _dodgeCooldownRemaining = 0f;
+        _missRecoveryRemaining = 0f;
+        _airDodgeUsed = false;
+        ClearHitResponse();
         FezOneWayPlatform.ReleasePlayer(_controller);
         ClearSupport();
         IsGrounded = false;
         _verticalSpeed = _speed = _coyote = _jumpBuffer = _dropTime = 0f;
+        _dropPlatforms.Clear();
         _wasRotating = _holdDepthAfterOccludedRotation = false;
+        _depthRamp = null;
         _lastDepthAxis = DepthAxis;
         WalkingSpeed = 0f;
         IsDropThroughActiveStatic = false;

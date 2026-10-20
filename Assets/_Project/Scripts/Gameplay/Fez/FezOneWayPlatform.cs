@@ -34,6 +34,13 @@ public sealed class FezOneWayPlatform : MonoBehaviour
     private Collider[] _bodies, _all;
     private int _registrationOrder;
 
+    public void ConfigureStandaloneBody(Collider body)
+    {
+        autoIncludeParentCollider = false;
+        platformBodyColliders = new[] { body };
+        topSurfaceReference = body;
+    }
+
     public struct SupportHit
     {
         public FezOneWayPlatform platform;
@@ -216,7 +223,8 @@ public sealed class FezOneWayPlatform : MonoBehaviour
     public static bool FindFloor(CharacterController player, Vector3 startFeet, Vector3 endFeet,
         Vector3 depthAxis, float tolerance, out SupportHit best, float ignoredTop = float.PositiveInfinity,
         bool characterMostlyVisible = true, float lateralMargin = 0f, bool preserveDepth = false,
-        System.Predicate<SupportHit> reachable = null)
+        System.Predicate<SupportHit> reachable = null,
+        IReadOnlyList<FezOneWayPlatform> fallbackPlatforms = null)
     {
         best = default;
         float top = float.NegativeInfinity;
@@ -232,7 +240,7 @@ public sealed class FezOneWayPlatform : MonoBehaviour
         {
             // A saturated or empty broad-phase result is not trusted; retain the original
             // complete search as a correctness fallback for unusual geometry/world scales.
-            foreach (var platform in Registered)
+            foreach (var platform in fallbackPlatforms ?? Registered)
                 ConsiderProjectedFloor(player, platform, startFeet, endFeet, depthAxis,
                     tolerance, ignoredTop, characterMostlyVisible, lateralMargin, preserveDepth,
                     ref top, ref best, reachable);
@@ -281,7 +289,8 @@ public sealed class FezOneWayPlatform : MonoBehaviour
 
     public static bool FindFloorAtCurrentDepth(Vector3 startFeet, Vector3 endFeet,
         float tolerance, out SupportHit best, Vector3 depthAxis, float lateralMargin = 0f,
-        float ignoredTop = float.PositiveInfinity)
+        float ignoredTop = float.PositiveInfinity, System.Predicate<SupportHit> reachable = null,
+        IReadOnlyList<FezOneWayPlatform> fallbackPlatforms = null)
     {
         best = default;
         float top = float.NegativeInfinity;
@@ -289,25 +298,26 @@ public sealed class FezOneWayPlatform : MonoBehaviour
         {
             for (int i = 0; i < CandidatePlatforms.Count; i++)
                 ConsiderAnchoredFloor(CandidatePlatforms[i], startFeet, endFeet,
-                    tolerance, depthAxis, lateralMargin, ignoredTop, ref top, ref best);
+                    tolerance, depthAxis, lateralMargin, ignoredTop, ref top, ref best, reachable);
         }
         else
         {
-            foreach (var platform in Registered)
+            foreach (var platform in fallbackPlatforms ?? Registered)
                 ConsiderAnchoredFloor(platform, startFeet, endFeet, tolerance,
-                    depthAxis, lateralMargin, ignoredTop, ref top, ref best);
+                    depthAxis, lateralMargin, ignoredTop, ref top, ref best, reachable);
         }
         return best.platform != null;
     }
 
     private static void ConsiderAnchoredFloor(FezOneWayPlatform platform, Vector3 startFeet,
         Vector3 endFeet, float tolerance, Vector3 depthAxis, float lateralMargin,
-        float ignoredTop, ref float top, ref SupportHit best)
+        float ignoredTop, ref float top, ref SupportHit best, System.Predicate<SupportHit> reachable)
     {
         if (platform == null || !platform.isActiveAndEnabled ||
             !platform.TryGetAnchoredFloor(startFeet, endFeet, tolerance, out var hit,
                 depthAxis, lateralMargin)) return;
         if (hit.point.y >= ignoredTop - tolerance || hit.point.y < top) return;
+        if (reachable != null && !reachable(hit)) return;
         top = hit.point.y;
         best = hit;
     }
@@ -476,6 +486,20 @@ public sealed class FezOneWayPlatform : MonoBehaviour
             if (body == null || !body.enabled || !body.gameObject.activeInHierarchy || body.isTrigger) continue;
             Bounds bounds = body.bounds;
             if (bounds.max.y + worldTopYOffset < minY || bounds.min.y + worldTopYOffset > maxY) continue;
+            var ramp = body.GetComponent<FezRampBlock>();
+            if (ramp != null)
+            {
+                if (ramp.TrySample(foot, axis, lateralMargin, out var rampPoint, out _) &&
+                    rampPoint.y + worldTopYOffset >= minY && rampPoint.y + worldTopYOffset <= maxY &&
+                    rampPoint.y + worldTopYOffset > top)
+                {
+                    if (preserveDepth) rampPoint += axis * Vector3.Dot(foot - rampPoint, axis);
+                    rampPoint.y += worldTopYOffset;
+                    top = rampPoint.y;
+                    result = new SupportHit { platform = this, collider = body, point = rampPoint };
+                }
+                continue;
+            }
             float side = Vector3.Dot(foot - bounds.center, right);
             float half = Mathf.Abs(right.x) * bounds.extents.x + Mathf.Abs(right.z) * bounds.extents.z;
             if (Mathf.Abs(side) > half + lateralMargin + 0.0001f) continue;
@@ -510,13 +534,42 @@ public sealed class FezOneWayPlatform : MonoBehaviour
         return false;
     }
     public Collider[] GetAllPlatformColliders() => _all;
-    public IEnumerable<Collider> GetSolidBodyColliders()
+    internal bool OverlapsViewColumn(Bounds query, Vector3 axis)
     {
-        if (_all == null) yield break;
+        if (_all == null) return true;
         foreach (var body in _all)
-            if (body != null && !body.isTrigger &&
-                body.GetComponentInParent<FezDepthProxyFollower>() == null &&
-                body.GetComponentInParent<FezBackgroundWall>() == null) yield return body;
+            if (body != null && body.enabled && body.gameObject.activeInHierarchy &&
+                FezBackgroundWall.OverlapsViewColumn(query, body.bounds, axis)) return true;
+        return false;
+    }
+    public SolidBodyEnumerable GetSolidBodyColliders() => new SolidBodyEnumerable(_all);
+
+    // A struct enumerator avoids allocating an iterator for every platform, every motor substep.
+    public struct SolidBodyEnumerable
+    {
+        private readonly Collider[] bodies;
+        internal SolidBodyEnumerable(Collider[] bodies) { this.bodies = bodies; }
+        public SolidBodyEnumerator GetEnumerator() => new SolidBodyEnumerator(bodies);
+    }
+
+    public struct SolidBodyEnumerator
+    {
+        private readonly Collider[] bodies;
+        private int index;
+        public Collider Current { get; private set; }
+        internal SolidBodyEnumerator(Collider[] bodies) { this.bodies = bodies; index = -1; Current = null; }
+        public bool MoveNext()
+        {
+            while (bodies != null && ++index < bodies.Length)
+            {
+                var body = bodies[index];
+                if (body == null || body.isTrigger || body.GetComponentInParent<FezDepthProxyFollower>() != null ||
+                    body.GetComponentInParent<FezBackgroundWall>() != null) continue;
+                Current = body;
+                return true;
+            }
+            return false;
+        }
     }
     // Compatibility for older callers: no global enable/disable cycle.
     public static void BeginPlayerMove(CharacterController player, float velocityY) => PreparePlayer(player);

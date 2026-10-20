@@ -220,13 +220,19 @@ public sealed class FezRotationOcclusionGate : MonoBehaviour
     {
         if (innerSampleRoot == null)
         {
-            var fourPoint = transform.Find("Four-point detection");
+            var fourPoint = FindSampleRoot();
             if (fourPoint != null)
                 innerSampleRoot = fourPoint.Find("Inner");
         }
 
         if (outerSampleRoot == null)
-            outerSampleRoot = transform.Find("Four-point detection");
+            outerSampleRoot = FindSampleRoot();
+    }
+
+    private Transform FindSampleRoot()
+    {
+        var root = transform.Find("ViewPivot/Four-point detection");
+        return root != null ? root : transform.Find("Four-point detection");
     }
 
     Transform[] GetOcclusionSamplePoints()

@@ -9,6 +9,10 @@ public sealed class Health : MonoBehaviour
 {
     [SerializeField] private int maxHealth = 100;
     [SerializeField] private float invulnerableSeconds = 0.25f;
+    [Tooltip("玩家每次有效受擊固定扣 1，避免舊攻擊設定造成大量傷害。")]
+    [SerializeField] private bool oneDamagePerHit;
+    public bool DebugInvincible { get; set; }
+    public bool DodgeInvulnerable { get; set; }
 
     private float _invulnerableUntil;
 
@@ -37,8 +41,11 @@ public sealed class Health : MonoBehaviour
     {
         if (amount <= 0 || IsDead)
             return;
+        if ((DebugInvincible || DodgeInvulnerable) && !ignoreInvulnerability) return;
         if (!ignoreInvulnerability && Time.time < _invulnerableUntil)
             return;
+
+        if (oneDamagePerHit) amount = 1;
 
         Current = Mathf.Max(0, Current - amount);
         if (invulnerableSeconds > 0f && !ignoreInvulnerability)
@@ -62,4 +69,16 @@ public sealed class Health : MonoBehaviour
 
         Healed?.Invoke(gained);
     }
+    /// <summary>Execution is explicitly separate from the normal one-damage-per-hit rule.</summary>
+    public bool TryExecute(Vector3 sourcePosition)
+    {
+        if (IsDead || DebugInvincible || DodgeInvulnerable || Time.time < _invulnerableUntil) return false;
+        int remaining = Current;
+        Current = 0;
+        _invulnerableUntil = Time.time + Mathf.Max(0f, invulnerableSeconds);
+        Damaged?.Invoke(remaining, sourcePosition);
+        Died?.Invoke();
+        return true;
+    }
+    public bool CanReceiveHit => !IsDead && !DebugInvincible && !DodgeInvulnerable && Time.time >= _invulnerableUntil;
 }

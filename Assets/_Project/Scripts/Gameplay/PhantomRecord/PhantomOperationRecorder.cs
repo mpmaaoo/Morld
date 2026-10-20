@@ -177,6 +177,8 @@ namespace Lichronicle.Gameplay.PhantomRecord
 
         private void RecordFrame()
         {
+            var motor = GetComponent<PlayerController>();
+            var layout = motor != null ? motor.gamepadLayout : GamepadLayout.Auto;
             var now = Time.time;
             var delta = Mathf.Max(0.0001f, now - _lastRecordTime);
             _lastRecordTime = now;
@@ -188,7 +190,7 @@ namespace Lichronicle.Gameplay.PhantomRecord
                 worldRotation = transform.rotation,
                 horizontal = Input.GetAxisRaw("Horizontal"),
                 vertical = Input.GetAxisRaw("Vertical"),
-                jumpDown = Input.GetButtonDown("Jump"),
+                jumpDown = Input.GetButtonDown("Jump") || Input.GetKeyDown(GamepadMapping.JumpKey(layout)),
                 keyDowns = ReadKeyDownsThisFrame()
             };
 

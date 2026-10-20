@@ -18,6 +18,8 @@ public sealed class FezBackgroundWall : MonoBehaviour
 
     [Tooltip("牆方塊幾何中心（例如 WallCenter）；留空則嘗試 Find(\"WallCenter\")。")]
     [SerializeField] private Transform depthReference;
+    private Collider _fallbackBody;
+    private Collider[] _fallbackBodies;
 
     public float ShallowRouteGridStep => shallowRouteGridStep;
 
@@ -117,23 +119,11 @@ public sealed class FezBackgroundWall : MonoBehaviour
 
     private static void ProjectBoundsOntoAxis(Bounds bounds, Vector3 axis, out float min, out float max)
     {
-        var c = bounds.min;
-        var s = bounds.size;
-        min = float.PositiveInfinity;
-        max = float.NegativeInfinity;
-        for (var xi = 0; xi <= 1; xi++)
-        {
-            for (var yi = 0; yi <= 1; yi++)
-            {
-                for (var zi = 0; zi <= 1; zi++)
-                {
-                    var p = new Vector3(c.x + s.x * xi, c.y + s.y * yi, c.z + s.z * zi);
-                    var d = Vector3.Dot(p, axis);
-                    if (d < min) min = d;
-                    if (d > max) max = d;
-                }
-            }
-        }
+        float centre = Vector3.Dot(bounds.center, axis);
+        Vector3 extents = bounds.extents;
+        float radius = Mathf.Abs(axis.x) * extents.x + Mathf.Abs(axis.y) * extents.y + Mathf.Abs(axis.z) * extents.z;
+        min = centre - radius;
+        max = centre + radius;
     }
 
     internal static bool OverlapsXZ(Bounds a, Bounds b)
@@ -147,37 +137,23 @@ public sealed class FezBackgroundWall : MonoBehaviour
         if (wallBodyColliders != null && wallBodyColliders.Length > 0)
             return wallBodyColliders;
 
-        var self = GetComponent<Collider>();
-        return self != null ? new[] { self } : System.Array.Empty<Collider>();
+        if (_fallbackBody == null)
+        {
+            _fallbackBody = GetComponent<Collider>();
+            _fallbackBodies = _fallbackBody != null ? new[] { _fallbackBody } : System.Array.Empty<Collider>();
+        }
+        return _fallbackBodies;
     }
 
     internal static float ProjectBoundsShallowDepth(Bounds b, Vector3 vf)
     {
-        var min = b.min;
-        var max = b.max;
-        var d0 = Vector3.Dot(new Vector3(min.x, min.y, min.z), vf);
-        var d1 = Vector3.Dot(new Vector3(max.x, min.y, min.z), vf);
-        var d2 = Vector3.Dot(new Vector3(min.x, max.y, min.z), vf);
-        var d3 = Vector3.Dot(new Vector3(max.x, max.y, min.z), vf);
-        var d4 = Vector3.Dot(new Vector3(min.x, min.y, max.z), vf);
-        var d5 = Vector3.Dot(new Vector3(max.x, min.y, max.z), vf);
-        var d6 = Vector3.Dot(new Vector3(min.x, max.y, max.z), vf);
-        var d7 = Vector3.Dot(new Vector3(max.x, max.y, max.z), vf);
-        return Mathf.Min(d0, d1, d2, d3, d4, d5, d6, d7);
+        ProjectBoundsOntoAxis(b, vf, out float min, out _);
+        return min;
     }
 
     internal static float ProjectBoundsDeepDepth(Bounds b, Vector3 vf)
     {
-        var min = b.min;
-        var max = b.max;
-        var d0 = Vector3.Dot(new Vector3(min.x, min.y, min.z), vf);
-        var d1 = Vector3.Dot(new Vector3(max.x, min.y, min.z), vf);
-        var d2 = Vector3.Dot(new Vector3(min.x, max.y, min.z), vf);
-        var d3 = Vector3.Dot(new Vector3(max.x, max.y, min.z), vf);
-        var d4 = Vector3.Dot(new Vector3(min.x, min.y, max.z), vf);
-        var d5 = Vector3.Dot(new Vector3(max.x, min.y, max.z), vf);
-        var d6 = Vector3.Dot(new Vector3(min.x, max.y, max.z), vf);
-        var d7 = Vector3.Dot(new Vector3(max.x, max.y, max.z), vf);
-        return Mathf.Max(d0, d1, d2, d3, d4, d5, d6, d7);
+        ProjectBoundsOntoAxis(b, vf, out _, out float max);
+        return max;
     }
 }

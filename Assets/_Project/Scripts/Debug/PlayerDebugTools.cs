@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using Lichronicle.Gameplay.PhantomRecord;
+using Lichronicle.Gameplay.Inputs;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
@@ -16,7 +17,6 @@ public sealed class PlayerDebugTools : MonoBehaviour
     [SerializeField, Range(4, 14)] private int visibleActionCount = 9;
     [SerializeField] private bool showOverlay = true;
     [Header("手把顯示")]
-    [SerializeField] private bool useXboxButtonLabels = true;
     [SerializeField, Range(0.05f, 0.5f)] private float gamepadAxisDeadzone = 0.2f;
 
     private const int MaxHistory = 120;
@@ -27,8 +27,6 @@ public sealed class PlayerDebugTools : MonoBehaviour
     private readonly List<string> _heldPadButtons = new List<string>(8);
     private readonly StringBuilder _padAxes = new StringBuilder(160);
     private readonly int[] _padAxisStates = new int[10];
-    private static readonly string[] PadButtonNames =
-        { "A", "B", "X", "Y", "LB", "RB", "Back", "Start", "LS", "RS" };
     private string _gamepadNames = "未連接";
     private float _nextGamepadScan;
     private PlayerController _player;
@@ -36,6 +34,24 @@ public sealed class PlayerDebugTools : MonoBehaviour
     private string _verticalState = "";
     private string _status = "";
     private float _statusUntil;
+    private GUIStyle _overlayStyle;
+    private readonly string[] _historyLabels = new string[14];
+    private int _historyVersion, _drawnHistoryVersion = -1, _drawnVisibleCount, _historyLabelCount;
+    private readonly List<string> _previousKeys = new List<string>(12), _previousButtons = new List<string>(8);
+    private string _keyboardHud = "鍵盤：（無）", _buttonsHud = "按住：（無）";
+    private string _padHud, _axesHud = "搖桿／方向／扳機：（回中）", _axesValue = "";
+    private string _hudPadNames;
+    private GamepadLayout _hudLayout;
+    private bool _hudDirty = true;
+    private float _keyboardHeight, _padHeight, _buttonsHeight, _axesHeight;
+    private static readonly string[] PadAxisNames = BuildAxisNames();
+    private static readonly Dictionary<KeyCode, string> KeyboardLabels = new Dictionary<KeyCode, string>();
+    private static string[] BuildAxisNames()
+    {
+        var names = new string[10];
+        for (int i = 0; i < names.Length; i++) names[i] = "MorldDebugPadAxis" + (i + 1);
+        return names;
+    }
 
     private struct InputTraceEvent
     {
@@ -48,6 +64,8 @@ public sealed class PlayerDebugTools : MonoBehaviour
     }
 
     private string LogPath => Path.Combine(Application.persistentDataPath, "MorldInputTrace.txt");
+    public void RecordDodge() { AddEvent("閃避開始"); }
+    public void RecordAttack() { AddEvent("近戰攻擊開始"); }
 
     private void Awake()
     {
@@ -62,6 +80,11 @@ public sealed class PlayerDebugTools : MonoBehaviour
 
     /// <summary>Called by PlayerController so the trace follows the same input source as movement.</summary>
     public void RecordInput(float horizontal, float vertical, bool jumpPressed)
+    {
+        using (InputTraceProfile.Auto()) RecordInputCore(horizontal, vertical, jumpPressed);
+    }
+    private static readonly Unity.Profiling.ProfilerMarker InputTraceProfile = new Unity.Profiling.ProfilerMarker("Morld.InputTrace");
+    private void RecordInputCore(float horizontal, float vertical, bool jumpPressed)
     {
         if (GetComponent<PhantomPlaybackInputSource>() != null)
         {
@@ -109,14 +132,14 @@ public sealed class PlayerDebugTools : MonoBehaviour
                 AddEvent("按鍵 " + KeyLabel(key));
         }
         RecordGamepad();
+        RefreshHudText();
         // Include this frame's keyboard and gamepad state in the bug snapshot.
         if (!hasModifier && Input.GetKeyDown(markBugKey)) MarkBug();
     }
 
     private string PadButtonLabel(int button)
     {
-        return useXboxButtonLabels && button < PadButtonNames.Length
-            ? PadButtonNames[button] + " [B" + button + "]" : "B" + button;
+        return GamepadMapping.ButtonLabel(button, _player != null ? _player.gamepadLayout : GamepadLayout.Auto);
     }
 
     private void RecordGamepad()
@@ -148,7 +171,7 @@ public sealed class PlayerDebugTools : MonoBehaviour
         _padAxes.Clear();
         for (int axis = 0; axis < _padAxisStates.Length; axis++)
         {
-            float raw = Input.GetAxisRaw("MorldDebugPadAxis" + (axis + 1));
+            float raw = Input.GetAxisRaw(PadAxisNames[axis]);
             float value = Mathf.Abs(raw) < gamepadAxisDeadzone ? 0f : raw;
             int state = value == 0f ? 0 : Mathf.RoundToInt(value * 4f);
             if (state != _padAxisStates[axis])
@@ -186,6 +209,7 @@ public sealed class PlayerDebugTools : MonoBehaviour
             support = _player != null && _player.StandingPlatform != null
                 ? _player.StandingPlatform.name : "無"
         });
+        _historyVersion++;
     }
 
     private void MarkBug()
@@ -235,43 +259,88 @@ public sealed class PlayerDebugTools : MonoBehaviour
             case KeyCode.Space: return "SPACE";
             case KeyCode.LeftShift: return "L-SHIFT";
             case KeyCode.RightShift: return "R-SHIFT";
-            default: return key.ToString().ToUpperInvariant();
+            default:
+                if (!KeyboardLabels.TryGetValue(key, out var label))
+                    KeyboardLabels.Add(key, label = key.ToString().ToUpperInvariant());
+                return label;
         }
     }
 
     private void OnGUI()
     {
         if (!showOverlay || !Application.isPlaying || _player == null ||
-            GetComponent<PhantomPlaybackInputSource>() != null) return;
-
-        int visible = Mathf.Clamp(visibleActionCount, 4, 14);
-        var wrap = new GUIStyle(GUI.skin.label) { wordWrap = true };
-        string keyboardText = "鍵盤：" + (_heldKeys.Count == 0 ? "（無）" : string.Join(" + ", _heldKeys));
-        string padText = "手把：" + _gamepadNames;
-        string buttonsText = "按住：" + (_heldPadButtons.Count == 0 ? "（無）" : string.Join(" + ", _heldPadButtons));
-        string axesText = "搖桿／方向／扳機：" + (_padAxes.Length == 0 ? "（回中）" : _padAxes.ToString());
-        float height = 76f + visible * 19f + wrap.CalcHeight(new GUIContent(keyboardText), 416f) +
-            wrap.CalcHeight(new GUIContent(padText), 416f) +
-            wrap.CalcHeight(new GUIContent(buttonsText), 416f) +
-            wrap.CalcHeight(new GUIContent(axesText), 416f) +
-            (Time.unscaledTime < _statusUntil ? 24f : 0f);
-        GUILayout.BeginArea(new Rect(12f, 12f, 440f, height), GUI.skin.box);
-        GUILayout.BeginVertical();
-        GUILayout.Label("MORLD  |  INPUT TRACE");
-        GUILayout.Label(keyboardText, wrap);
-        GUILayout.Label(padText, wrap);
-        GUILayout.Label(buttonsText, wrap);
-        GUILayout.Label(axesText, wrap);
-        GUILayout.Label($"F6 標記 Bug  ·  F7 顯示/隱藏  ·  F8 返回上一個平台");
-
-        InputTraceEvent[] entries = _history.ToArray();
-        int first = Mathf.Max(0, entries.Length - visible);
-        for (int i = first; i < entries.Length; i++)
-            GUILayout.Label($"{entries[i].elapsed,6:F2}s  {entries[i].action}");
-
-        if (Time.unscaledTime < _statusUntil)
-            GUILayout.Label(_status);
-        GUILayout.EndVertical();
-        GUILayout.EndArea();
+            Event.current.type != EventType.Repaint) return;
+        using (HudProfile.Auto()) DrawOverlay();
     }
+
+    private static readonly Unity.Profiling.ProfilerMarker HudProfile = new Unity.Profiling.ProfilerMarker("Morld.InputHud");
+    private void RefreshHudText()
+    {
+        RefreshHeldText(_heldKeys, _previousKeys, "鍵盤：", ref _keyboardHud);
+        RefreshHeldText(_heldPadButtons, _previousButtons, "按住：", ref _buttonsHud);
+        var layout = GamepadMapping.Resolve(_player != null ? _player.gamepadLayout : GamepadLayout.Auto);
+        if (_hudPadNames != _gamepadNames || _hudLayout != layout || _padHud == null)
+        {
+            _hudPadNames = _gamepadNames; _hudLayout = layout;
+            _padHud = "手把：" + _gamepadNames + "\n配置：" + layout + "（下方跳躍／左方攻擊／右方閃避）";
+            _hudDirty = true;
+        }
+        bool sameAxes = _axesValue.Length == _padAxes.Length;
+        for (int i = 0; sameAxes && i < _padAxes.Length; i++) sameAxes = _axesValue[i] == _padAxes[i];
+        if (!sameAxes)
+        {
+            _axesValue = _padAxes.ToString();
+            _axesHud = "搖桿／方向／扳機：" + (_axesValue.Length == 0 ? "（回中）" : _axesValue);
+            _hudDirty = true;
+        }
+    }
+
+    private void RefreshHeldText(List<string> held, List<string> previous, string prefix, ref string text)
+    {
+        bool same = held.Count == previous.Count;
+        for (int i = 0; same && i < held.Count; i++) same = held[i] == previous[i];
+        if (same) return;
+        previous.Clear(); previous.AddRange(held);
+        text = prefix + (held.Count == 0 ? "（無）" : string.Join(" + ", held));
+        _hudDirty = true;
+    }
+
+    private void DrawOverlay()
+    {
+        int visible = Mathf.Clamp(visibleActionCount, 4, 14);
+        if (_overlayStyle == null) { _overlayStyle = new GUIStyle(GUI.skin.label) { wordWrap = true }; _hudDirty = true; }
+        if (_padHud == null) RefreshHudText();
+        if (_hudDirty)
+        {
+            _keyboardHeight = _overlayStyle.CalcHeight(new GUIContent(_keyboardHud), 416f);
+            _padHeight = _overlayStyle.CalcHeight(new GUIContent(_padHud), 416f);
+            _buttonsHeight = _overlayStyle.CalcHeight(new GUIContent(_buttonsHud), 416f);
+            _axesHeight = _overlayStyle.CalcHeight(new GUIContent(_axesHud), 416f);
+            _hudDirty = false;
+        }
+        if (_drawnHistoryVersion != _historyVersion || _drawnVisibleCount != visible)
+        {
+            int skip = Mathf.Max(0, _history.Count - visible), index = 0;
+            _historyLabelCount = 0;
+            foreach (var entry in _history)
+                if (index++ >= skip) _historyLabels[_historyLabelCount++] = $"{entry.elapsed,6:F2}s  {entry.action}";
+            _drawnHistoryVersion = _historyVersion; _drawnVisibleCount = visible;
+        }
+        bool statusVisible = Time.unscaledTime < _statusUntil;
+        float height = 76f + visible * 19f + _keyboardHeight + _padHeight + _buttonsHeight + _axesHeight + (statusVisible ? 24f : 0f);
+        GUI.BeginGroup(new Rect(12f, 12f, 440f, height));
+        GUI.Box(new Rect(0, 0, 440f, height), GUIContent.none);
+        float y = 8f;
+        DrawHudLine("MORLD  |  INPUT TRACE", 22f, ref y);
+        DrawHudLine(_keyboardHud, _keyboardHeight, ref y);
+        DrawHudLine(_padHud, _padHeight, ref y);
+        DrawHudLine(_buttonsHud, _buttonsHeight, ref y);
+        DrawHudLine(_axesHud, _axesHeight, ref y);
+        DrawHudLine("F6 標記 Bug  ·  F7 顯示/隱藏  ·  F8 返回上一個平台", 24f, ref y);
+        for (int i = 0; i < _historyLabelCount; i++) DrawHudLine(_historyLabels[i], 19f, ref y);
+        if (statusVisible) DrawHudLine(_status, 24f, ref y);
+        GUI.EndGroup();
+    }
+    private void DrawHudLine(string text, float height, ref float y)
+    { GUI.Label(new Rect(12f, y, 416f, height), text, _overlayStyle); y += height; }
 }

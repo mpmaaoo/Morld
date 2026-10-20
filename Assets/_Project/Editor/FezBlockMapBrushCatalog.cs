@@ -42,6 +42,17 @@ public static class FezBlockMapBrushCatalog
             previewColor: new Color(0.95f, 0.25f, 0.5f, 0.35f),
             fieldLabel: "邊界牆 Prefab",
             matches: MatchesBoundary),
+
+        new FezBlockMapBrushDef("ramp", "斜面方塊", "Morld.FezBlockMap.RampGuid", "",
+            new Color(0.25f, 0.8f, 1f, 0.4f), "斜面 Prefab（可留空）",
+            (source, instance) => HasComponent(source, instance, typeof(FezRampBlock)),
+            factory: MorldRampAuthoring.CreateRampObject),
+        new FezBlockMapBrushDef("playerSpawn", "玩家生成點", "Morld.FezBlockMap.PlayerSpawnGuid",
+            "6124c2c967a49a8489ec387c723b2a30", new Color(0.2f, 1f, 0.8f, 0.5f), "玩家生成點 Prefab",
+            (source, instance) => HasComponent(source, instance, typeof(PlayerSpawner)), isSpawn: true),
+        new FezBlockMapBrushDef("enemySpawn", "敵人生成點", "Morld.FezBlockMap.EnemySpawnGuid",
+            "66bc7f23a96c5e84e9070e62fa914f96", new Color(1f, 0.35f, 0.25f, 0.5f), "敵人生成點 Prefab",
+            (source, instance) => HasComponent(source, instance, typeof(EnemySpawnPoint)), isSpawn: true),
     };
 
     public static int IndexOfId(string id)
@@ -138,6 +149,8 @@ public sealed class FezBlockMapBrushDef
     public readonly Color PreviewColor;
     public readonly string FieldLabel;
     public readonly Func<GameObject, GameObject, bool> Matches;
+    public readonly bool IsSpawn;
+    public readonly Func<GameObject> Factory;
 
     public FezBlockMapBrushDef(
         string id,
@@ -146,7 +159,7 @@ public sealed class FezBlockMapBrushDef
         string defaultPrefabGuid,
         Color previewColor,
         string fieldLabel,
-        Func<GameObject, GameObject, bool> matches)
+        Func<GameObject, GameObject, bool> matches, bool isSpawn = false, Func<GameObject> factory = null)
     {
         Id = id;
         DisplayName = displayName;
@@ -155,6 +168,8 @@ public sealed class FezBlockMapBrushDef
         PreviewColor = previewColor;
         FieldLabel = fieldLabel;
         Matches = matches ?? ((_, __) => false);
+        IsSpawn = isSpawn;
+        Factory = factory;
     }
 }
 #endif

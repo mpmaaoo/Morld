@@ -24,6 +24,8 @@ namespace Lichronicle.Gameplay.Abilities
 
         private void Update()
         {
+            var motor = GetComponent<PlayerController>();
+            if (motor != null && motor.IsActionLocked) return;
             var inputSource = GetInputSource();
             var now = Time.time;
 

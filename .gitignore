@@ -1,0 +1,23 @@
+# Unity-generated local data
+/[Ll]ibrary/
+/[Tt]emp/
+/[Oo]bj/
+/[Ll]ogs/
+/[Uu]ser[Ss]ettings/
+/[Bb]uild/
+/[Bb]uilds/
+/MemoryCaptures/
+/Recordings/
+
+# Generated IDE files
+/.vs/
+/.idea/
+/*.csproj
+/*.sln
+/*.slnx
+/*.user
+/*.suo
+
+# Local comparison package, retained on disk
+/FezPrisonAreaFix_20261020/
+/FezPrisonAreaFix_20261020.zip

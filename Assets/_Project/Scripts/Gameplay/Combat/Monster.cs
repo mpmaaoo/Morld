@@ -11,7 +11,6 @@ public sealed class Monster : MonoBehaviour
 {
     private static readonly List<Monster> Alive = new List<Monster>();
 
-    [SerializeField] private int contactDamage = 10;
     [SerializeField] private float gravity = -25f;
     [SerializeField] private float maxFallSpeed = 10f;
 
@@ -148,7 +147,7 @@ public sealed class Monster : MonoBehaviour
                 continue;
 
             var center = _hitbox.transform.TransformPoint(_hitbox.center);
-            other.Damage(contactDamage, center);
+            other.Damage(1, center);
             // 無敵時不會扣血，但碰撞箱還疊在一起就要繼續被擊退。
             var gridPlayer = other.GetComponent<FezGridTestPlayer>();
             if (gridPlayer != null)

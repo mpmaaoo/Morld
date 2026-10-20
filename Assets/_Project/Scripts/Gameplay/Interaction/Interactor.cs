@@ -23,6 +23,8 @@ namespace Lichronicle.Gameplay.Interaction
 
         private void Update()
         {
+            var motor = GetComponent<PlayerController>();
+            if (motor != null && motor.IsActionLocked) return;
             _current = FindBestInteractable();
 
             var inputSource = GetInputSource();

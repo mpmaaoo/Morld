@@ -1,0 +1,30 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a11ed51504fb4d85a1b22ac751cbb409, type: 3}
+  m_Name: PatrolGuard
+  m_EditorClassIdentifier:
+  displayName: 巡邏守衛
+  designerNotes: Attack damage is always 1. Override individual encounters on spawn points.
+  prefab: {fileID: 6750133063365596269, guid: 366e842dc7259c1428c6f1845233b6dc, type: 3}
+  settings:
+    pursuitLockRadius: 2
+    health: 5
+    movement: 1
+    patrolSpeed: 1
+    patrolHalfDistance: 2
+    reach: 1.4
+    verticalReach: 0.8
+    windup: 0.65
+    attackDuration: 0.12
+    recovery: 1
+    attackInterval: 2
+  gizmoColor: {r: 1, g: 0.45, b: 0.1, a: 1}

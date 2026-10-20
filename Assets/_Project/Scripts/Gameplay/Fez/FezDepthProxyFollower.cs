@@ -151,6 +151,12 @@ public sealed class FezDepthProxyFollower : MonoBehaviour
 
     private void Tick(float dt, bool alignToPlatformBody = false)
     {
+        using (ProxyProfile.Auto()) TickCore(dt, alignToPlatformBody);
+    }
+
+    private static readonly Unity.Profiling.ProfilerMarker ProxyProfile = new Unity.Profiling.ProfilerMarker("Morld.DepthProxySync");
+    private void TickCore(float dt, bool alignToPlatformBody)
+    {
         // The new motor reads real platform geometry; moving an invisible collider is obsolete.
         if (playerRoot != null && playerRoot.TryGetComponent<PlayerController>(out var motor)
             && motor.isActiveAndEnabled) return;
